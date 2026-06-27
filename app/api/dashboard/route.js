@@ -5,7 +5,8 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 const WINDSOR_BASE = "https://connectors.windsor.ai/google_ads";
-const ABACATE_BASE = "https://api.abacatepay.com/v1/billing/list";
+const ABACATE_V2 = "https://api.abacatepay.com/v2";
+const ABACATE_V1 = "https://api.abacatepay.com/v1";
 
 function todayISO() {
   return new Date().toISOString().slice(0, 10);
@@ -18,6 +19,11 @@ function firstOfMonthISO() {
 function num(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
+}
+
+function inRange(dateStr, from, to) {
+  if (!dateStr) return false;
+  return dateStr >= from && dateStr <= to;
 }
 
 // ---------- Google Ads (via Windsor.ai) ----------
@@ -44,7 +50,7 @@ async function fetchGoogleAds(from, to) {
   if (!res.ok) {
     if (res.status === 401 || res.status === 403) {
       throw new Error(
-        "chave WINDSOR_API_KEY inválida ou sem acesso (verifique a API key no painel do Windsor)."
+        "chave WINDSOR_API_KEY inválida ou sem acesso à API de dados do Windsor."
       );
     }
     const t = await res.text();
@@ -56,53 +62,114 @@ async function fetchGoogleAds(from, to) {
 }
 
 // ---------- AbacatePay ----------
-async function fetchAbacate(apiKey) {
-  if (!apiKey) return [];
-  const res = await fetch(ABACATE_BASE, {
+async function abFetch(url, apiKey) {
+  const res = await fetch(url, {
     headers: {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
     cache: "no-store",
   });
-  if (!res.ok) {
-    const t = await res.text();
-    if (/version mismatch/i.test(t)) {
-      throw new Error(
-        "chave do Abacate é v2; este dashboard usa a API v1. Gere uma chave v1 no painel do AbacatePay."
-      );
-    }
-    throw new Error(`Abacate ${res.status}: ${t.slice(0, 160)}`);
+  const text = await res.text();
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    /* resposta não-JSON */
   }
-  const json = await res.json();
-  // resposta: { data: [ ...billings ], error: null }
-  return Array.isArray(json) ? json : json.data || [];
+  return { res, json, text };
 }
 
-function isPaid(b) {
-  const s = String(b.status || "").toUpperCase();
-  return s === "PAID";
+// transforma um item (v2 ou v1) em { amount: reais, date: 'YYYY-MM-DD' }
+function normalizeTx(it) {
+  const date = String(it.paidAt || it.createdAt || it.created_at || it.updatedAt || "").slice(
+    0,
+    10
+  );
+  return { amount: num(it.amount) / 100, date };
 }
 
-// valor pago em reais (Abacate retorna em centavos)
-function paidAmountReais(b) {
-  return num(b.amount) / 100;
+// lista paginada de um recurso v2 já filtrando pelo status pago
+async function listV2(path, paidStatus, apiKey) {
+  const out = [];
+  let after = null;
+  for (let page = 0; page < 50; page++) {
+    const u = new URL(`${ABACATE_V2}${path}`);
+    u.searchParams.set("limit", "100");
+    u.searchParams.set("status", paidStatus);
+    if (after) u.searchParams.set("after", after);
+
+    const { res, json, text } = await abFetch(u.toString(), apiKey);
+    if (!res.ok) {
+      const err = new Error(text.slice(0, 200));
+      err.status = res.status;
+      err.body = text;
+      throw err;
+    }
+    const items = (json && json.data) || [];
+    for (const it of items) out.push(it);
+
+    if (items.length < 100) break;
+
+    // descobre o cursor da próxima página
+    const pg = (json && json.pagination) || {};
+    let next =
+      pg.after || pg.nextCursor || pg.cursor || pg.next || null;
+    if (!next && items[items.length - 1]) next = items[items.length - 1].id;
+    if (!next || next === after) break;
+    after = next;
+  }
+  return out;
 }
 
-function billingDate(b) {
-  const raw = b.paidAt || b.createdAt || b.created_at || b.updatedAt;
-  if (!raw) return null;
-  return String(raw).slice(0, 10);
+// v1 (chaves antigas): /billing/list devolve tudo; filtramos PAID
+async function listV1Billings(apiKey) {
+  const { res, json, text } = await abFetch(`${ABACATE_V1}/billing/list`, apiKey);
+  if (!res.ok) {
+    const err = new Error(text.slice(0, 200));
+    err.status = res.status;
+    err.body = text;
+    throw err;
+  }
+  const items = (json && json.data) || [];
+  return items.filter((b) => String(b.status).toUpperCase() === "PAID");
 }
 
-function inRange(dateStr, from, to) {
-  if (!dateStr) return false;
-  return dateStr >= from && dateStr <= to;
+// Busca as transações pagas de uma marca. Tenta v2; se a chave for v1, cai para v1.
+// Retorna array normalizado [{ amount: reais, date }].
+async function fetchAbacateTransactions(apiKey) {
+  if (!apiKey) return [];
+
+  // ---- tentativa v2 ----
+  try {
+    const [checkouts, transparents, pix] = await Promise.all([
+      listV2("/checkouts/list", "PAID", apiKey),
+      listV2("/transparents/list", "PAID", apiKey).catch(() => []),
+      listV2("/pix/list", "COMPLETE", apiKey).catch(() => []),
+    ]);
+
+    // junta tudo, deduplica por id (um pagamento vive em um só recurso)
+    const seen = new Set();
+    const all = [];
+    for (const it of [...checkouts, ...transparents, ...pix]) {
+      const id = it.id || JSON.stringify(it);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      all.push(normalizeTx(it));
+    }
+    return all;
+  } catch (e) {
+    const isVersionMismatch =
+      /version mismatch/i.test(e.body || e.message || "") || e.status === 401;
+    if (!isVersionMismatch) throw e;
+    // ---- fallback v1 ----
+    const billings = await listV1Billings(apiKey);
+    return billings.map(normalizeTx);
+  }
 }
 
 // agrega uma marca: junta gasto (Google) + receita/transações (Abacate)
-function buildBrand(name, gadsRows, abacateBillings, from, to) {
-  // --- Google Ads ---
+function buildBrand(name, gadsRows, abacateTx, from, to) {
   const daily = {}; // date -> { spend, revenue, transactions }
   let spend = 0,
     clicks = 0,
@@ -124,24 +191,19 @@ function buildBrand(name, gadsRows, abacateBillings, from, to) {
     daily[d].spend += s;
   }
 
-  // --- Abacate ---
   let revenue = 0,
     transactions = 0;
-  for (const b of abacateBillings) {
-    if (!isPaid(b)) continue;
-    const d = billingDate(b);
-    if (!inRange(d, from, to)) continue;
-    const amt = paidAmountReais(b);
-    revenue += amt;
+  for (const t of abacateTx) {
+    if (!inRange(t.date, from, to)) continue;
+    revenue += t.amount;
     transactions += 1;
-    if (!daily[d]) daily[d] = { date: d, spend: 0, revenue: 0, transactions: 0 };
-    daily[d].revenue += amt;
-    daily[d].transactions += 1;
+    if (!daily[t.date])
+      daily[t.date] = { date: t.date, spend: 0, revenue: 0, transactions: 0 };
+    daily[t.date].revenue += t.amount;
+    daily[t.date].transactions += 1;
   }
 
-  const series = Object.values(daily).sort((a, b) =>
-    a.date < b.date ? -1 : 1
-  );
+  const series = Object.values(daily).sort((a, b) => (a.date < b.date ? -1 : 1));
 
   const cpa = transactions > 0 ? spend / transactions : null;
   const roas = spend > 0 ? revenue / spend : null;
@@ -173,27 +235,27 @@ export async function GET(request) {
 
   const errors = [];
   let gadsRows = [];
-  let abProcesso = [];
-  let abPlaca = [];
+  let txProcesso = [];
+  let txPlaca = [];
 
   const results = await Promise.allSettled([
     fetchGoogleAds(from, to),
-    fetchAbacate(process.env.ABACATE_KEY_PROCESSO),
-    fetchAbacate(process.env.ABACATE_KEY_PLACA),
+    fetchAbacateTransactions(process.env.ABACATE_KEY_PROCESSO),
+    fetchAbacateTransactions(process.env.ABACATE_KEY_PLACA),
   ]);
 
   if (results[0].status === "fulfilled") gadsRows = results[0].value;
   else errors.push(`Google Ads: ${results[0].reason.message}`);
 
-  if (results[1].status === "fulfilled") abProcesso = results[1].value;
+  if (results[1].status === "fulfilled") txProcesso = results[1].value;
   else errors.push(`Abacate (Processo): ${results[1].reason.message}`);
 
-  if (results[2].status === "fulfilled") abPlaca = results[2].value;
+  if (results[2].status === "fulfilled") txPlaca = results[2].value;
   else errors.push(`Abacate (Placa): ${results[2].reason.message}`);
 
   const brands = [
-    buildBrand(nameProcesso, gadsRows, abProcesso, from, to),
-    buildBrand(namePlaca, gadsRows, abPlaca, from, to),
+    buildBrand(nameProcesso, gadsRows, txProcesso, from, to),
+    buildBrand(namePlaca, gadsRows, txPlaca, from, to),
   ];
 
   // total consolidado
