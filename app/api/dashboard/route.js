@@ -42,8 +42,13 @@ async function fetchGoogleAds(from, to) {
 
   const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) {
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(
+        "chave WINDSOR_API_KEY inválida ou sem acesso (verifique a API key no painel do Windsor)."
+      );
+    }
     const t = await res.text();
-    throw new Error(`Windsor ${res.status}: ${t.slice(0, 200)}`);
+    throw new Error(`Windsor ${res.status}: ${t.slice(0, 160)}`);
   }
   const json = await res.json();
   const rows = Array.isArray(json) ? json : json.data || [];
@@ -62,7 +67,12 @@ async function fetchAbacate(apiKey) {
   });
   if (!res.ok) {
     const t = await res.text();
-    throw new Error(`Abacate ${res.status}: ${t.slice(0, 200)}`);
+    if (/version mismatch/i.test(t)) {
+      throw new Error(
+        "chave do Abacate é v2; este dashboard usa a API v1. Gere uma chave v1 no painel do AbacatePay."
+      );
+    }
+    throw new Error(`Abacate ${res.status}: ${t.slice(0, 160)}`);
   }
   const json = await res.json();
   // resposta: { data: [ ...billings ], error: null }
