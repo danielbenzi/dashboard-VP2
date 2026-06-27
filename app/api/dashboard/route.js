@@ -44,7 +44,7 @@ async function fetchGoogleAds(from, to) {
   const url =
     `${WINDSOR_BASE}?api_key=${encodeURIComponent(key)}` +
     `&date_from=${from}&date_to=${to}` +
-    `&fields=${fields}&force_refresh=true`;
+    `&fields=${fields}`;
 
   const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) {
