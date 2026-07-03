@@ -147,7 +147,9 @@ async function listV2(path, paidStatus, apiKey, from) {
 
     const { res, json, text } = await abFetch(u.toString(), apiKey);
     if (!res.ok || (json && json.success === false)) {
-      const err = new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
+      const err = new Error(
+        `HTTP ${res.status} (página ${page + 1}): ${text.slice(0, 200)}`
+      );
       err.status = res.status;
       err.body = text;
       throw err;
@@ -155,7 +157,10 @@ async function listV2(path, paidStatus, apiKey, from) {
     const items = (json && json.data) || [];
     for (const it of items) out.push(it);
 
-    if (items.length < 100) break;
+    // paginação por cursor, exatamente como documentado:
+    // pagination: { hasMore: boolean, next: string, before: string }
+    const pg = (json && json.pagination) || {};
+    if (!pg.hasMore || !pg.next || pg.next === after) break;
 
     // parada antecipada: se a lista vem em ordem decrescente de data e a página
     // inteira já é mais antiga que `from`, as próximas também serão
@@ -166,11 +171,7 @@ async function listV2(path, paidStatus, apiKey, from) {
       if (descending && dFirst && dFirst < from) break;
     }
 
-    const pg = (json && json.pagination) || {};
-    let next = pg.after || pg.nextCursor || pg.cursor || pg.next || null;
-    if (!next && items[items.length - 1]) next = items[items.length - 1].id;
-    if (!next || next === after) break;
-    after = next;
+    after = pg.next;
   }
   return out;
 }
