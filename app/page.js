@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 const BRL = new Intl.NumberFormat("pt-BR", {
   style: "currency",
@@ -21,12 +21,19 @@ function fmtRoas(v) {
   return v.toFixed(2) + "x";
 }
 
-function firstOfMonth() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-01`;
-}
+// datas sempre em America/Sao_Paulo (mesmo fuso usado pela API)
+const TZ = "America/Sao_Paulo";
 function today() {
-  return new Date().toISOString().slice(0, 10);
+  return new Date().toLocaleDateString("en-CA", { timeZone: TZ });
+}
+function firstOfMonth() {
+  const [y, m] = today().split("-");
+  return `${y}-${m}-01`;
+}
+function daysAgo(n) {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return d.toLocaleDateString("en-CA", { timeZone: TZ });
 }
 
 export default function Page() {
@@ -35,24 +42,43 @@ export default function Page() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState(null);
+  const abortRef = useRef(null);
 
-  // load() pode ser chamada pelo onClick do botão, que passa o evento do clique
-  // como primeiro argumento. Por isso só aceitamos strings de data — qualquer
-  // outra coisa (evento, undefined) cai no valor atual do estado.
-  async function load(f, t) {
-    const fromArg = typeof f === "string" ? f : from;
-    const toArg = typeof t === "string" ? t : to;
+  async function load(f = from, t = to) {
+    // cancela request anterior ainda em andamento (evita resposta velha
+    // sobrescrever a nova — outra fonte de inconsistência)
+    if (abortRef.current) abortRef.current.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+
     setLoading(true);
     setErr(null);
     try {
-      const res = await fetch(`/api/dashboard?from=${fromArg}&to=${toArg}`);
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "Falha ao carregar");
+      const res = await fetch(`/api/dashboard?from=${f}&to=${t}`, {
+        signal: ctrl.signal,
+      });
+      const text = await res.text();
+      let json = null;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        /* resposta não-JSON (ex.: página de erro 504 da Vercel) */
+      }
+      if (!res.ok) {
+        throw new Error(
+          json?.error ||
+            (res.status === 504
+              ? "O servidor demorou demais para responder. Tente novamente."
+              : `Falha ao carregar (HTTP ${res.status})`)
+        );
+      }
+      if (!json) throw new Error("Resposta inválida do servidor.");
       setData(json);
     } catch (e) {
+      if (e.name === "AbortError") return; // request substituído, ignora
       setErr(e.message);
     } finally {
-      setLoading(false);
+      if (abortRef.current === ctrl) setLoading(false);
     }
   }
 
@@ -64,15 +90,8 @@ export default function Page() {
   function applyPreset(p) {
     const t = today();
     let f = firstOfMonth();
-    if (p === "7d") {
-      const d = new Date();
-      d.setDate(d.getDate() - 6);
-      f = d.toISOString().slice(0, 10);
-    } else if (p === "30d") {
-      const d = new Date();
-      d.setDate(d.getDate() - 29);
-      f = d.toISOString().slice(0, 10);
-    }
+    if (p === "7d") f = daysAgo(6);
+    else if (p === "30d") f = daysAgo(29);
     setFrom(f);
     setTo(t);
     load(f, t);
@@ -89,7 +108,9 @@ export default function Page() {
               <>
                 {" "}
                 · atualizado{" "}
-                {new Date(data.updatedAt).toLocaleString("pt-BR")}
+                {new Date(data.updatedAt).toLocaleString("pt-BR", {
+                  timeZone: TZ,
+                })}
               </>
             )}
           </p>
@@ -106,16 +127,23 @@ export default function Page() {
             onChange={(e) => setFrom(e.target.value)}
           />
           <input type="date" value={to} onChange={(e) => setTo(e.target.value)} />
-          <button className="btn" onClick={() => load(from, to)} disabled={loading}>
+          <button className="btn" onClick={() => load()} disabled={loading}>
             {loading ? "Carregando…" : "Atualizar"}
           </button>
         </div>
       </div>
 
-      {err && <div className="banner">Erro: {err}</div>}
+      {err && (
+        <div className="banner">
+          Erro: {err}{" "}
+          <button className="btn" onClick={() => load()}>
+            Tentar de novo
+          </button>
+        </div>
+      )}
       {data?.errors?.length > 0 && (
         <div className="banner">
-          Algumas fontes não responderam:
+          Algumas fontes não responderam (números podem estar incompletos):
           <ul>
             {data.errors.map((e, i) => (
               <li key={i}>{e}</li>
