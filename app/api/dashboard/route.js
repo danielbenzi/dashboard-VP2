@@ -16,6 +16,9 @@ const memCache = new Map(); // key -> { at, payload }
 // último resultado COMPLETO (sem erros) por janela de datas — usado como
 // fallback quando o Abacate falha, para os números não "desabarem"
 const lastGood = new Map(); // key -> payload
+// última listagem boa POR FONTE (marca+endpoint+janela): se uma fonte falhar,
+// usa os dados salvos dela em vez de zerar a receita
+const srcCache = new Map(); // key -> { at, items }
 
 const TZ = "America/Sao_Paulo";
 
@@ -140,18 +143,24 @@ function normalizeTx(it) {
 }
 
 // lista paginada de um recurso v2, com parada antecipada quando as páginas
-// já são todas anteriores a `from` (evita varrer o histórico inteiro)
-async function listV2(path, paidStatus, apiKey, from) {
+// já são todas anteriores a `from` (evita varrer o histórico inteiro).
+// Se a API rejeitar o filtro ?status= com HTTP 400 (acontece de forma
+// intermitente), refaz a listagem SEM o filtro e filtra aqui no código.
+async function listV2(path, paidStatus, apiKey, from, useStatusParam = true) {
   const out = [];
   let after = null;
   for (let page = 0; page < 50; page++) {
     const u = new URL(`${ABACATE_V2}${path}`);
     u.searchParams.set("limit", "100");
-    u.searchParams.set("status", paidStatus);
+    if (useStatusParam) u.searchParams.set("status", paidStatus);
     if (after) u.searchParams.set("after", after);
 
     const { res, json, text } = await abFetch(u.toString(), apiKey);
     if (!res.ok || (json && json.success === false)) {
+      if (res.status === 400 && useStatusParam) {
+        // plano B: lista sem o filtro de status e filtra client-side
+        return listV2(path, paidStatus, apiKey, from, false);
+      }
       const err = new Error(
         `HTTP ${res.status} (página ${page + 1}): ${text.slice(0, 200)}`
       );
@@ -159,7 +168,10 @@ async function listV2(path, paidStatus, apiKey, from) {
       err.body = text;
       throw err;
     }
-    const items = (json && json.data) || [];
+    const raw = (json && json.data) || [];
+    const items = useStatusParam
+      ? raw
+      : raw.filter((it) => String(it.status).toUpperCase() === paidStatus);
     for (const it of items) out.push(it);
 
     // Paginação: a doc promete pagination: { hasMore, next }, mas na prática
@@ -167,20 +179,20 @@ async function listV2(path, paidStatus, apiKey, from) {
     // (100 itens), assume que há mais; cursor = pagination.next ou, na falta
     // dele, o id do último item.
     const pg = (json && json.pagination) || {};
-    const fullPage = items.length >= 100;
+    const fullPage = raw.length >= 100;
     if (!fullPage && pg.hasMore !== true) break;
 
     // parada antecipada: se a lista vem em ordem decrescente de data e a página
     // inteira já é mais antiga que `from`, as próximas também serão
-    if (from && items.length > 1) {
-      const dFirst = txDate(items[0]);
-      const dLast = txDate(items[items.length - 1]);
+    if (from && raw.length > 1) {
+      const dFirst = txDate(raw[0]);
+      const dLast = txDate(raw[raw.length - 1]);
       const descending = dFirst >= dLast;
       if (descending && dFirst && dFirst < from) break;
     }
 
     let next = pg.next || pg.after || null;
-    if (!next && items.length > 0) next = items[items.length - 1].id;
+    if (!next && raw.length > 0) next = raw[raw.length - 1].id;
     if (!next || next === after) break;
     after = next;
   }
@@ -221,12 +233,27 @@ async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel) {
     ];
     const settled = [];
     for (const p of paths) {
-      settled.push(
-        await listV2(p, "PAID", apiKey, from).then(
-          (value) => ({ status: "fulfilled", value }),
-          (reason) => ({ status: "rejected", reason })
-        )
-      );
+      const cacheKey = `${apiKey.slice(0, 12)}:${p}:${from}`;
+      try {
+        const value = await listV2(p, "PAID", apiKey, from);
+        srcCache.set(cacheKey, { at: Date.now(), items: value });
+        settled.push({ status: "fulfilled", value });
+      } catch (reason) {
+        const saved = srcCache.get(cacheKey);
+        if (saved) {
+          const hora = new Date(saved.at).toLocaleTimeString("pt-BR", {
+            timeZone: TZ,
+            hour: "2-digit",
+            minute: "2-digit",
+          });
+          warnings.push(
+            `Abacate (${brandLabel}${p}): falhou agora — usando dados salvos das ${hora}`
+          );
+          settled.push({ status: "fulfilled", value: saved.items });
+        } else {
+          settled.push({ status: "rejected", reason });
+        }
+      }
     }
 
     // checkouts é obrigatório; se falhar, propaga (pode ser chave v1)
@@ -329,7 +356,7 @@ export async function GET(request) {
   if (hit && Date.now() - hit.at < CACHE_TTL_MS && hit.payload.errors.length === 0) {
     return NextResponse.json(
       { ...hit.payload, cached: true },
-      { headers: { "Cache-Control": "s-maxage=60, stale-while-revalidate=300" } }
+      { headers: { "Cache-Control": "s-maxage=120, stale-while-revalidate=86400" } }
     );
   }
 
@@ -417,7 +444,7 @@ export async function GET(request) {
     memCache.set(cacheKey, { at: Date.now(), payload });
     lastGood.set(cacheKey, payload);
     return NextResponse.json(payload, {
-      headers: { "Cache-Control": "s-maxage=60, stale-while-revalidate=300" },
+      headers: { "Cache-Control": "s-maxage=120, stale-while-revalidate=86400" },
     });
   }
 
