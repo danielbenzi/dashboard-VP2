@@ -349,14 +349,17 @@ export async function GET(request) {
   const { searchParams } = new URL(request.url);
   const from = searchParams.get("from") || firstOfMonthISO();
   const to = searchParams.get("to") || todayISO();
+  // ?refresh=1 (botão Atualizar): ignora TODOS os caches e busca tudo na hora
+  const force = searchParams.get("refresh") === "1";
 
   // cache em memória: mesma janela de datas dentro do TTL responde na hora
+  // (pulado quando o usuário pede refresh explícito)
   const cacheKey = `${from}:${to}`;
   const hit = memCache.get(cacheKey);
-  if (hit && Date.now() - hit.at < CACHE_TTL_MS && hit.payload.errors.length === 0) {
+  if (!force && hit && Date.now() - hit.at < CACHE_TTL_MS && hit.payload.errors.length === 0) {
     return NextResponse.json(
       { ...hit.payload, cached: true },
-      { headers: { "Cache-Control": "s-maxage=120, stale-while-revalidate=86400" } }
+      { headers: { "Cache-Control": "s-maxage=120, stale-while-revalidate=120" } }
     );
   }
 
@@ -444,7 +447,12 @@ export async function GET(request) {
     memCache.set(cacheKey, { at: Date.now(), payload });
     lastGood.set(cacheKey, payload);
     return NextResponse.json(payload, {
-      headers: { "Cache-Control": "s-maxage=120, stale-while-revalidate=86400" },
+      headers: {
+        // refresh explícito nunca é guardado na CDN — sempre dado fresco
+        "Cache-Control": force
+          ? "no-store"
+          : "s-maxage=120, stale-while-revalidate=120",
+      },
     });
   }
 
