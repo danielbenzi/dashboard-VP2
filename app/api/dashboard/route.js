@@ -8,11 +8,11 @@ const WINDSOR_BASE = "https://connectors.windsor.ai/google_ads";
 const ABACATE_V2 = "https://api.abacatepay.com/v2";
 
 function todayISO() {
-  return new Date().toISOString().slice(0, 10);
+  // "hoje" em horário de Brasília
+  return new Date().toLocaleDateString("en-CA", { timeZone: "America/Sao_Paulo" });
 }
 function firstOfMonthISO() {
-  const d = new Date();
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-01`;
+  return todayISO().slice(0, 8) + "01"; // YYYY-MM-01 (Brasília)
 }
 function num(v) {
   const n = Number(v);
@@ -131,17 +131,24 @@ function amountReais(it) {
   return sum / 100;
 }
 
+// Data do pagamento no fuso de Brasília (America/Sao_Paulo), para bater com o
+// painel do AbacatePay. Os timestamps da API vêm em UTC; agrupar por UTC jogava
+// as transações da madrugada para o dia seguinte.
 function paidDate(it) {
-  return String(
+  const raw =
     it.paidAt ||
-      it.paid_at ||
-      it.completedAt ||
-      it.updatedAt ||
-      it.updated_at ||
-      it.createdAt ||
-      it.created_at ||
-      ""
-  ).slice(0, 10);
+    it.paid_at ||
+    it.completedAt ||
+    it.updatedAt ||
+    it.updated_at ||
+    it.createdAt ||
+    it.created_at ||
+    "";
+  if (!raw) return "";
+  const d = new Date(raw);
+  if (isNaN(d.getTime())) return String(raw).slice(0, 10);
+  // en-CA => "YYYY-MM-DD"
+  return d.toLocaleDateString("en-CA", { timeZone: "America/Sao_Paulo" });
 }
 
 // Busca a receita paga (checkouts + PIX QR) de uma conta.
