@@ -47,7 +47,9 @@ export default function Page() {
   const [err, setErr] = useState(null);
   const abortRef = useRef(null);
 
-  async function load(f = from, t = to) {
+  // force=true (botão Atualizar): manda ?refresh=1, que faz a API ignorar
+  // todos os caches e buscar os dados na hora
+  async function load(f = from, t = to, force = false) {
     // cancela request anterior ainda em andamento
     if (abortRef.current) abortRef.current.abort();
     const ctrl = new AbortController();
@@ -56,9 +58,13 @@ export default function Page() {
     setLoading(true);
     setErr(null);
     try {
-      const res = await fetch(`/api/dashboard?from=${f}&to=${t}`, {
-        signal: ctrl.signal,
-      });
+      const res = await fetch(
+        `/api/dashboard?from=${f}&to=${t}${force ? "&refresh=1" : ""}`,
+        {
+          signal: ctrl.signal,
+          cache: "no-store",
+        }
+      );
       const text = await res.text();
       let json = null;
       try {
@@ -129,7 +135,11 @@ export default function Page() {
             onChange={(e) => setFrom(e.target.value)}
           />
           <input type="date" value={to} onChange={(e) => setTo(e.target.value)} />
-          <button className="btn" onClick={() => load()} disabled={loading}>
+          <button
+            className="btn"
+            onClick={() => load(from, to, true)}
+            disabled={loading}
+          >
             {loading ? "Carregando…" : "Atualizar"}
           </button>
         </div>
@@ -138,7 +148,7 @@ export default function Page() {
       {err && (
         <div className="banner">
           Erro: {err}{" "}
-          <button className="btn" onClick={() => load()}>
+          <button className="btn" onClick={() => load(from, to, true)}>
             Tentar de novo
           </button>
         </div>
