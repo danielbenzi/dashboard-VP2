@@ -162,10 +162,13 @@ async function listV2(path, paidStatus, apiKey, from) {
     const items = (json && json.data) || [];
     for (const it of items) out.push(it);
 
-    // paginação por cursor, exatamente como documentado:
-    // pagination: { hasMore: boolean, next: string, before: string }
+    // Paginação: a doc promete pagination: { hasMore, next }, mas na prática
+    // a API nem sempre devolve esses campos. Regra: se a página veio CHEIA
+    // (100 itens), assume que há mais; cursor = pagination.next ou, na falta
+    // dele, o id do último item.
     const pg = (json && json.pagination) || {};
-    if (!pg.hasMore || !pg.next || pg.next === after) break;
+    const fullPage = items.length >= 100;
+    if (!fullPage && pg.hasMore !== true) break;
 
     // parada antecipada: se a lista vem em ordem decrescente de data e a página
     // inteira já é mais antiga que `from`, as próximas também serão
@@ -176,7 +179,10 @@ async function listV2(path, paidStatus, apiKey, from) {
       if (descending && dFirst && dFirst < from) break;
     }
 
-    after = pg.next;
+    let next = pg.next || pg.after || null;
+    if (!next && items.length > 0) next = items[items.length - 1].id;
+    if (!next || next === after) break;
+    after = next;
   }
   return out;
 }
