@@ -36,11 +36,16 @@ export default function Page() {
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState(null);
 
-  async function load(f = from, t = to) {
+  // load() pode ser chamada pelo onClick do botão, que passa o evento do clique
+  // como primeiro argumento. Por isso só aceitamos strings de data — qualquer
+  // outra coisa (evento, undefined) cai no valor atual do estado.
+  async function load(f, t) {
+    const fromArg = typeof f === "string" ? f : from;
+    const toArg = typeof t === "string" ? t : to;
     setLoading(true);
     setErr(null);
     try {
-      const res = await fetch(`/api/dashboard?from=${f}&to=${t}`);
+      const res = await fetch(`/api/dashboard?from=${fromArg}&to=${toArg}`);
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "Falha ao carregar");
       setData(json);
@@ -101,7 +106,7 @@ export default function Page() {
             onChange={(e) => setFrom(e.target.value)}
           />
           <input type="date" value={to} onChange={(e) => setTo(e.target.value)} />
-          <button className="btn" onClick={load} disabled={loading}>
+          <button className="btn" onClick={() => load(from, to)} disabled={loading}>
             {loading ? "Carregando…" : "Atualizar"}
           </button>
         </div>
