@@ -14,12 +14,10 @@ function firstOfMonthISO() {
   const d = new Date();
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-01`;
 }
-
 function num(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
 }
-
 function inRange(dateStr, from, to) {
   if (!dateStr) return false;
   return dateStr >= from && dateStr <= to;
@@ -61,16 +59,16 @@ async function fetchGoogleAds(from, to) {
 }
 
 // ================= AbacatePay (API v2) =================
-// Base: https://api.abacatepay.com/v2  · valores em CENTAVOS · envelope { data, success, error }
-// RECEITA vem de /checkouts/list (checkout hospedado) e /transparents/list (PIX embutido).
-// /pix/list é TRANSFERÊNCIA DE SAÍDA (não é receita) — não usar.
+// Base: https://api.abacatepay.com/v2 · valores em CENTAVOS · envelope { data, success, error, pagination }
+// Receita = /checkouts/list (cartão) + /transparents/list (PIX QR Code).
+// Considera PAGO apenas status "PAID". REFUNDED (estornado), CANCELLED, EXPIRED,
+// PENDING não entram. /pix/list é transferência de saída — não é receita.
 
-async function abFetch(url, apiKey) {
-  const res = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
+// GET simples com Bearer. Sem Content-Type (é GET, não tem corpo) — alguns
+// endpoints (transparents) recusam GET com Content-Type: application/json.
+async function abFetch(path, apiKey) {
+  const res = await fetch(`${ABACATE_V2}${path}`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
     cache: "no-store",
   });
   const text = await res.text();
@@ -83,48 +81,35 @@ async function abFetch(url, apiKey) {
   return { res, json, text };
 }
 
-// Lista paginada de um recurso v2, SEM filtrar por status no servidor
-// (o filtro de pago é feito no cliente, que é mais confiável).
-async function listV2(path, apiKey) {
+// Lista paginada por cursor (pagination.hasMore / pagination.next).
+async function listAll(basePath, apiKey) {
   const out = [];
   let after = null;
-  for (let page = 0; page < 50; page++) {
-    const u = new URL(`${ABACATE_V2}${path}`);
-    u.searchParams.set("limit", "100");
-    if (after) u.searchParams.set("after", after);
+  for (let page = 0; page < 200; page++) {
+    const sep = basePath.includes("?") ? "&" : "?";
+    let path = `${basePath}${sep}limit=100`;
+    if (after) path += `&after=${encodeURIComponent(after)}`;
 
-    const { res, json, text } = await abFetch(u.toString(), apiKey);
+    const { res, json, text } = await abFetch(path, apiKey);
     if (!res.ok) {
-      const err = new Error(`AbacatePay ${res.status}: ${text.slice(0, 200)}`);
+      const err = new Error(`AbacatePay ${res.status}: ${text.slice(0, 160)}`);
       err.status = res.status;
       throw err;
     }
-
-    // data pode ser array direto ou { data: [...] } / { items: [...] }
-    let items = [];
-    const d = json && json.data;
-    if (Array.isArray(d)) items = d;
-    else if (d && Array.isArray(d.data)) items = d.data;
-    else if (d && Array.isArray(d.items)) items = d.items;
-    else if (Array.isArray(json)) items = json;
-
+    const items = (json && Array.isArray(json.data) && json.data) || [];
     for (const it of items) out.push(it);
-    if (items.length < 100) break;
 
-    const pg = (json && (json.pagination || (json.data && json.data.pagination))) || {};
-    let next = pg.after || pg.nextCursor || pg.cursor || pg.next || null;
-    if (!next && items.length) next = items[items.length - 1].id;
+    const pg = (json && json.pagination) || {};
+    if (!pg.hasMore) break;
+    const next = pg.next || pg.after || null;
     if (!next || next === after) break;
     after = next;
   }
   return out;
 }
 
-// Considera PAGO apenas os status abaixo. Tudo o mais — REFUNDED (estornado),
-// CANCELLED, EXPIRED, PENDING, DISPUTED, LOST — é ignorado.
 function isPaid(status) {
-  const s = String(status || "").toUpperCase();
-  return s === "PAID" || s === "COMPLETE" || s === "COMPLETED";
+  return String(status || "").toUpperCase() === "PAID";
 }
 
 // valor pago em CENTAVOS -> reais
@@ -134,7 +119,6 @@ function amountReais(it) {
     const n = Number(c);
     if (Number.isFinite(n) && n > 0) return n / 100;
   }
-  // fallback: soma de products/items (price em centavos * quantity)
   const list = Array.isArray(it.products)
     ? it.products
     : Array.isArray(it.items)
@@ -147,7 +131,6 @@ function amountReais(it) {
   return sum / 100;
 }
 
-// data do pagamento
 function paidDate(it) {
   return String(
     it.paidAt ||
@@ -161,39 +144,44 @@ function paidDate(it) {
   ).slice(0, 10);
 }
 
-// Busca receita de TODAS as fontes de venda (checkouts hospedados, PIX
-// transparente e assinaturas), mantém só as PAGAS, deduplica por id e normaliza.
-// /pix/list é transferência de SAÍDA (não é receita) — não entra.
+// Busca a receita paga (checkouts + PIX QR) de uma conta.
 async function fetchAbacate(apiKey) {
-  if (!apiKey)
-    return { checkouts: [], transparents: [], subscriptions: [], tx: [] };
+  if (!apiKey) return { checkouts: [], transparents: [], tx: [], fontes: {} };
 
-  const [checkouts, transparents, subscriptions] = await Promise.all([
-    listV2("/checkouts/list", apiKey).catch(() => []),
-    listV2("/transparents/list", apiKey).catch(() => []),
-    listV2("/subscriptions/list", apiKey).catch(() => []),
-  ]);
+  const fontes = {};
+  let checkouts = [];
+  let transparents = [];
+
+  try {
+    checkouts = await listAll("/checkouts/list", apiKey);
+    fontes.checkouts = { total: checkouts.length, pagos: checkouts.filter((x) => isPaid(x.status)).length };
+  } catch (e) {
+    fontes.checkouts = { erro: e.message };
+  }
+
+  try {
+    transparents = await listAll("/transparents/list", apiKey);
+    fontes.transparents = { total: transparents.length, pagos: transparents.filter((x) => isPaid(x.status)).length };
+  } catch (e) {
+    fontes.transparents = { erro: e.message };
+  }
 
   const seen = new Set();
   const tx = [];
-  for (const it of [...checkouts, ...transparents, ...subscriptions]) {
-    if (!isPaid(it.status)) continue; // só pago; estornos/pendentes ficam de fora
+  for (const it of [...checkouts, ...transparents]) {
+    if (!isPaid(it.status)) continue;
     const id = it.id || JSON.stringify(it);
     if (seen.has(id)) continue;
     seen.add(id);
     tx.push({ amount: amountReais(it), date: paidDate(it) });
   }
-  return { checkouts, transparents, subscriptions, tx };
+  return { checkouts, transparents, tx, fontes };
 }
 
 // ---------- Agregação por marca ----------
 function buildBrand(name, gadsRows, abacateTx, from, to) {
   const daily = {};
-  let spend = 0,
-    clicks = 0,
-    impressions = 0,
-    gadsConversions = 0,
-    gadsConvValue = 0;
+  let spend = 0, clicks = 0, impressions = 0, gadsConversions = 0, gadsConvValue = 0;
 
   for (const r of gadsRows) {
     if (String(r.account_name).trim() !== name) continue;
@@ -209,14 +197,12 @@ function buildBrand(name, gadsRows, abacateTx, from, to) {
     daily[d].spend += s;
   }
 
-  let revenue = 0,
-    transactions = 0;
+  let revenue = 0, transactions = 0;
   for (const t of abacateTx) {
     if (!inRange(t.date, from, to)) continue;
     revenue += t.amount;
     transactions += 1;
-    if (!daily[t.date])
-      daily[t.date] = { date: t.date, spend: 0, revenue: 0, transactions: 0 };
+    if (!daily[t.date]) daily[t.date] = { date: t.date, spend: 0, revenue: 0, transactions: 0 };
     daily[t.date].revenue += t.amount;
     daily[t.date].transactions += 1;
   }
@@ -243,8 +229,8 @@ export async function GET(request) {
 
   const errors = [];
   let gadsRows = [];
-  let abProcesso = { checkouts: [], transparents: [], tx: [] };
-  let abPlaca = { checkouts: [], transparents: [], tx: [] };
+  let abProcesso = { tx: [], fontes: {} };
+  let abPlaca = { tx: [], fontes: {} };
 
   const results = await Promise.allSettled([
     fetchGoogleAds(from, to),
@@ -261,76 +247,21 @@ export async function GET(request) {
   if (results[2].status === "fulfilled") abPlaca = results[2].value;
   else errors.push(`Abacate (Placa): ${results[2].reason.message}`);
 
-  // ---- DEBUG: /api/dashboard?debug=abacate ----
-  // Testa variações das chamadas para descobrir a forma correta de listar
-  // (principalmente /transparents/list, que estava dando 400) e o formato de paginação.
   if (debug === "abacate") {
-    async function rawGet(path, apiKey) {
-      const { res, json, text } = await abFetch(`${ABACATE_V2}${path}`, apiKey);
-      let dataLen = null;
-      let pagination = null;
-      let firstItem = null;
-      if (json) {
-        const d = json.data;
-        const arr = Array.isArray(d)
-          ? d
-          : d && Array.isArray(d.data)
-          ? d.data
-          : d && Array.isArray(d.items)
-          ? d.items
-          : Array.isArray(json)
-          ? json
-          : null;
-        if (arr) {
-          dataLen = arr.length;
-          if (arr[0])
-            firstItem = {
-              id: arr[0].id,
-              status: arr[0].status,
-              amount: arr[0].amount,
-              paidAmount: arr[0].paidAmount,
-              methods: arr[0].methods || arr[0].method,
-            };
-        }
-        pagination =
-          json.pagination || (json.data && json.data.pagination) || null;
-      }
-      return {
-        status: res.status,
-        ok: res.ok,
-        dataLen,
-        pagination,
-        firstItem,
-        bodySnippet: text.slice(0, 200),
-      };
-    }
-
-    async function probe(apiKey) {
-      if (!apiKey) return { erro: "chave não configurada" };
-      const paths = [
-        "/checkouts/list",
-        "/checkouts/list?limit=100",
-        "/transparents/list",
-        "/transparents/list?limit=25",
-        "/transparents/list?limit=50",
-        "/transparents/list?limit=100",
-      ];
-      const out = {};
-      for (const p of paths) {
-        try {
-          out[p] = await rawGet(p, apiKey);
-        } catch (e) {
-          out[p] = { erro: e.message };
-        }
-      }
-      return out;
-    }
-
-    const [probeProcesso] = await Promise.all([
-      probe(process.env.ABACATE_KEY_PROCESSO),
-    ]);
-
-    return NextResponse.json({ period: { from, to }, processo: probeProcesso, errors });
+    return NextResponse.json({
+      period: { from, to },
+      processo: {
+        fontes: abProcesso.fontes,
+        total_tx: abProcesso.tx.length,
+        amostra_tx: abProcesso.tx.slice(0, 8),
+      },
+      placa: {
+        fontes: abPlaca.fontes,
+        total_tx: abPlaca.tx.length,
+        amostra_tx: abPlaca.tx.slice(0, 8),
+      },
+      errors,
+    });
   }
 
   const brands = [
@@ -341,8 +272,7 @@ export async function GET(request) {
   const merged = {};
   for (const br of brands) {
     for (const p of br.series) {
-      if (!merged[p.date])
-        merged[p.date] = { date: p.date, spend: 0, revenue: 0, transactions: 0 };
+      if (!merged[p.date]) merged[p.date] = { date: p.date, spend: 0, revenue: 0, transactions: 0 };
       merged[p.date].spend += p.spend;
       merged[p.date].revenue += p.revenue;
       merged[p.date].transactions += p.transactions;
