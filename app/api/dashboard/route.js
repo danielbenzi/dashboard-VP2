@@ -200,7 +200,9 @@ async function fetchAbacate(apiKey) {
   await sleep(150);
 
   try {
-    transparents = await listAll("/transparents/list", apiKey, fontes.paginas.transparents);
+    // status=PAID: pega só os PIX pagos. Sem esse filtro o endpoint tenta listar
+    // TODOS os QR codes já gerados (a maioria PENDING/EXPIRED), fica pesado e dá 400.
+    transparents = await listAll("/transparents/list?status=PAID", apiKey, fontes.paginas.transparents);
     fontes.transparents = { total: transparents.length, pagos: transparents.filter((x) => isPaid(x.status)).length };
   } catch (e) {
     fontes.transparents = { erro: e.message };
