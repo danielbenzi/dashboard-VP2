@@ -120,9 +120,12 @@ async function abFetch(url, apiKey) {
 }
 
 // converte timestamp (UTC) para a data em America/Sao_Paulo —
-// venda das 22h BRT não pode cair no dia seguinte
+// venda das 22h BRT não pode cair no dia seguinte.
+// Preferência: paidAt > updatedAt > createdAt. Como filtramos status=PAID,
+// o updatedAt é quando o pagamento foi confirmado — o createdAt é a criação
+// do QR Code, que pode ser no dia anterior ao pagamento.
 function txDate(it) {
-  const raw = it.paidAt || it.createdAt || it.created_at || it.updatedAt || "";
+  const raw = it.paidAt || it.updatedAt || it.createdAt || it.created_at || "";
   if (!raw) return "";
   const d = new Date(raw);
   if (isNaN(d)) return String(raw).slice(0, 10);
@@ -130,8 +133,10 @@ function txDate(it) {
 }
 
 // transforma um item (v2 ou v1) em { amount: reais, date: 'YYYY-MM-DD' }
+// paidAmount (quando existe) é o valor efetivamente pago
 function normalizeTx(it) {
-  return { amount: num(it.amount) / 100, date: txDate(it) };
+  const cents = it.paidAmount != null ? it.paidAmount : it.amount;
+  return { amount: num(cents) / 100, date: txDate(it) };
 }
 
 // lista paginada de um recurso v2, com parada antecipada quando as páginas
@@ -198,16 +203,19 @@ async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel) {
   try {
     // Obs.: /pix/list NÃO entra aqui — na API do Abacate ele lista
     // transferências PIX ENVIADAS (dinheiro saindo), não pagamentos recebidos.
-    // PIX recebido já aparece em checkouts e transparents.
+    // Fontes de receita: checkouts, transparents (PIX/Boleto embutido),
+    // links de pagamento e assinaturas.
     const settled = await Promise.allSettled([
       listV2("/checkouts/list", "PAID", apiKey, from),
       listV2("/transparents/list", "PAID", apiKey, from),
+      listV2("/payment-links/list", "PAID", apiKey, from),
+      listV2("/subscriptions/list", "PAID", apiKey, from),
     ]);
 
     // checkouts é obrigatório; se falhar, propaga (pode ser chave v1)
     if (settled[0].status === "rejected") throw settled[0].reason;
 
-    const labels = ["checkouts", "transparents"];
+    const labels = ["checkouts", "transparents", "payment-links", "subscriptions"];
     const lists = [];
     settled.forEach((r, i) => {
       if (r.status === "fulfilled") lists.push(r.value);
