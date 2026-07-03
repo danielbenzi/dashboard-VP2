@@ -120,6 +120,8 @@ async function listV2(path, apiKey) {
   return out;
 }
 
+// Considera PAGO apenas os status abaixo. Tudo o mais — REFUNDED (estornado),
+// CANCELLED, EXPIRED, PENDING, DISPUTED, LOST — é ignorado.
 function isPaid(status) {
   const s = String(status || "").toUpperCase();
   return s === "PAID" || s === "COMPLETE" || s === "COMPLETED";
@@ -159,25 +161,29 @@ function paidDate(it) {
   ).slice(0, 10);
 }
 
-// Busca receita (checkouts + transparents) de uma conta e normaliza as pagas.
+// Busca receita de TODAS as fontes de venda (checkouts hospedados, PIX
+// transparente e assinaturas), mantém só as PAGAS, deduplica por id e normaliza.
+// /pix/list é transferência de SAÍDA (não é receita) — não entra.
 async function fetchAbacate(apiKey) {
-  if (!apiKey) return { checkouts: [], transparents: [], tx: [] };
+  if (!apiKey)
+    return { checkouts: [], transparents: [], subscriptions: [], tx: [] };
 
-  const [checkouts, transparents] = await Promise.all([
-    listV2("/checkouts/list", apiKey),
+  const [checkouts, transparents, subscriptions] = await Promise.all([
+    listV2("/checkouts/list", apiKey).catch(() => []),
     listV2("/transparents/list", apiKey).catch(() => []),
+    listV2("/subscriptions/list", apiKey).catch(() => []),
   ]);
 
   const seen = new Set();
   const tx = [];
-  for (const it of [...checkouts, ...transparents]) {
-    if (!isPaid(it.status)) continue;
+  for (const it of [...checkouts, ...transparents, ...subscriptions]) {
+    if (!isPaid(it.status)) continue; // só pago; estornos/pendentes ficam de fora
     const id = it.id || JSON.stringify(it);
     if (seen.has(id)) continue;
     seen.add(id);
     tx.push({ amount: amountReais(it), date: paidDate(it) });
   }
-  return { checkouts, transparents, tx };
+  return { checkouts, transparents, subscriptions, tx };
 }
 
 // ---------- Agregação por marca ----------
