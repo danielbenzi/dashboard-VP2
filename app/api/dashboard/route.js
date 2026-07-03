@@ -3,6 +3,13 @@ import { NextResponse } from "next/server";
 // Sempre buscar dados frescos (sem cache da Vercel)
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
+export const maxDuration = 60; // paginação faz várias chamadas — dá folga
+
+// Cache em memória do último resultado BOM (sem erro de PIX), por ~90s.
+// Estabiliza o dashboard: atualizações seguidas mostram o mesmo número
+// em vez de oscilar quando o AbacatePay falha em alguma requisição.
+const CACHE_TTL_MS = 90 * 1000;
+const CACHE = globalThis.__vpDashCache || (globalThis.__vpDashCache = new Map());
 
 const WINDSOR_BASE = "https://connectors.windsor.ai/google_ads";
 const ABACATE_V2 = "https://api.abacatepay.com/v2";
@@ -97,13 +104,16 @@ async function abFetchRetry(path, apiKey, tries = 4) {
   return last;
 }
 
-// Lista paginada por cursor (pagination.hasMore / pagination.next), com retry.
-async function listAll(basePath, apiKey) {
+// Lista paginada por cursor, com retry e throttle. Continua enquanto a página
+// vier cheia (== limit), usando o cursor da paginação ou, na falta dele, o id
+// do último item (o AbacatePay aceita o id como cursor "after").
+const LIMIT = 100;
+async function listAll(basePath, apiKey, debugPages) {
   const out = [];
   let after = null;
-  for (let page = 0; page < 200; page++) {
+  for (let page = 0; page < 500; page++) {
     const sep = basePath.includes("?") ? "&" : "?";
-    let path = `${basePath}${sep}limit=100`;
+    let path = `${basePath}${sep}limit=${LIMIT}`;
     if (after) path += `&after=${encodeURIComponent(after)}`;
 
     const { res, json, text } = await abFetchRetry(path, apiKey);
@@ -115,11 +125,14 @@ async function listAll(basePath, apiKey) {
     const items = (json && Array.isArray(json.data) && json.data) || [];
     for (const it of items) out.push(it);
 
-    const pg = (json && json.pagination) || {};
-    if (!pg.hasMore) break;
-    const next = pg.next || pg.after || null;
+    const pg = (json && (json.pagination || (json.data && json.data.pagination))) || {};
+    if (debugPages) debugPages.push({ page, got: items.length, pagination: pg });
+
+    if (items.length < LIMIT) break; // última página
+    let next = pg.next || pg.after || (items[items.length - 1] && items[items.length - 1].id);
     if (!next || next === after) break;
     after = next;
+    await sleep(150); // throttle entre páginas para não tomar 400
   }
   return out;
 }
@@ -171,21 +184,23 @@ function paidDate(it) {
 async function fetchAbacate(apiKey) {
   if (!apiKey) return { checkouts: [], transparents: [], tx: [], fontes: {}, warn: null };
 
-  const fontes = {};
+  const fontes = { paginas: { checkouts: [], transparents: [] } };
   let checkouts = [];
   let transparents = [];
   let warn = null;
 
   try {
-    checkouts = await listAll("/checkouts/list", apiKey);
+    checkouts = await listAll("/checkouts/list", apiKey, fontes.paginas.checkouts);
     fontes.checkouts = { total: checkouts.length, pagos: checkouts.filter((x) => isPaid(x.status)).length };
   } catch (e) {
     fontes.checkouts = { erro: e.message };
     warn = `cartão não respondeu (${e.message})`;
   }
 
+  await sleep(150);
+
   try {
-    transparents = await listAll("/transparents/list", apiKey);
+    transparents = await listAll("/transparents/list", apiKey, fontes.paginas.transparents);
     fontes.transparents = { total: transparents.length, pagos: transparents.filter((x) => isPaid(x.status)).length };
   } catch (e) {
     fontes.transparents = { erro: e.message };
@@ -251,6 +266,15 @@ export async function GET(request) {
   const to = searchParams.get("to") || todayISO();
   const debug = searchParams.get("debug");
 
+  // Serve o último resultado bom em cache (evita oscilação em refreshes seguidos)
+  const cacheKey = `${from}|${to}`;
+  if (!debug) {
+    const hit = CACHE.get(cacheKey);
+    if (hit && Date.now() - hit.at < CACHE_TTL_MS) {
+      return NextResponse.json({ ...hit.payload, cached: true });
+    }
+  }
+
   const nameProcesso = process.env.GADS_ACCOUNT_PROCESSO || "Verifica Processo";
   const namePlaca = process.env.GADS_ACCOUNT_PLACA || "Verifica Placa";
 
@@ -259,24 +283,30 @@ export async function GET(request) {
   let abProcesso = { tx: [], fontes: {} };
   let abPlaca = { tx: [], fontes: {} };
 
-  const results = await Promise.allSettled([
-    fetchGoogleAds(from, to),
-    fetchAbacate(process.env.ABACATE_KEY_PROCESSO),
-    fetchAbacate(process.env.ABACATE_KEY_PLACA),
-  ]);
+  // Google Ads em paralelo; AbacatePay das duas marcas em SÉRIE (uma de cada vez)
+  // para não estourar o limite de requisições concorrentes do AbacatePay.
+  const gadsPromise = fetchGoogleAds(from, to).catch((e) => {
+    errors.push(`Google Ads: ${e.message}`);
+    return [];
+  });
 
-  if (results[0].status === "fulfilled") gadsRows = results[0].value;
-  else errors.push(`Google Ads: ${results[0].reason.message}`);
-
-  if (results[1].status === "fulfilled") {
-    abProcesso = results[1].value;
+  try {
+    abProcesso = await fetchAbacate(process.env.ABACATE_KEY_PROCESSO);
     if (abProcesso.warn) errors.push(`AbacatePay Processo: ${abProcesso.warn}`);
-  } else errors.push(`Abacate (Processo): ${results[1].reason.message}`);
+  } catch (e) {
+    errors.push(`Abacate (Processo): ${e.message}`);
+  }
 
-  if (results[2].status === "fulfilled") {
-    abPlaca = results[2].value;
+  await sleep(200);
+
+  try {
+    abPlaca = await fetchAbacate(process.env.ABACATE_KEY_PLACA);
     if (abPlaca.warn) errors.push(`AbacatePay Placa: ${abPlaca.warn}`);
-  } else errors.push(`Abacate (Placa): ${results[2].reason.message}`);
+  } catch (e) {
+    errors.push(`Abacate (Placa): ${e.message}`);
+  }
+
+  gadsRows = await gadsPromise;
 
   if (debug === "abacate") {
     return NextResponse.json({
@@ -324,11 +354,17 @@ export async function GET(request) {
     series: Object.values(merged).sort((a, b) => (a.date < b.date ? -1 : 1)),
   };
 
-  return NextResponse.json({
+  const payload = {
     period: { from, to },
     updatedAt: new Date().toISOString(),
     total,
     brands,
     errors,
-  });
+  };
+
+  // Só cacheia se o AbacatePay respondeu direito (sem erro/aviso de PIX).
+  const abacateFalhou = errors.some((e) => /abacate|abacatepay/i.test(e));
+  if (!abacateFalhou) CACHE.set(cacheKey, { at: Date.now(), payload });
+
+  return NextResponse.json(payload);
 }
