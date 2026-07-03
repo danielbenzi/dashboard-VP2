@@ -81,7 +81,23 @@ async function abFetch(path, apiKey) {
   return { res, json, text };
 }
 
-// Lista paginada por cursor (pagination.hasMore / pagination.next).
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// GET com retry: o AbacatePay às vezes devolve 400/429/5xx de forma intermitente
+// (limite de requisições). Tentamos algumas vezes antes de desistir.
+async function abFetchRetry(path, apiKey, tries = 4) {
+  let last;
+  for (let i = 0; i < tries; i++) {
+    const r = await abFetch(path, apiKey);
+    if (r.res.ok) return r;
+    last = r;
+    // 400/429/5xx costumam ser transitórios aqui — espera e tenta de novo
+    await sleep(400 + i * 400);
+  }
+  return last;
+}
+
+// Lista paginada por cursor (pagination.hasMore / pagination.next), com retry.
 async function listAll(basePath, apiKey) {
   const out = [];
   let after = null;
@@ -90,7 +106,7 @@ async function listAll(basePath, apiKey) {
     let path = `${basePath}${sep}limit=100`;
     if (after) path += `&after=${encodeURIComponent(after)}`;
 
-    const { res, json, text } = await abFetch(path, apiKey);
+    const { res, json, text } = await abFetchRetry(path, apiKey);
     if (!res.ok) {
       const err = new Error(`AbacatePay ${res.status}: ${text.slice(0, 160)}`);
       err.status = res.status;
@@ -153,17 +169,19 @@ function paidDate(it) {
 
 // Busca a receita paga (checkouts + PIX QR) de uma conta.
 async function fetchAbacate(apiKey) {
-  if (!apiKey) return { checkouts: [], transparents: [], tx: [], fontes: {} };
+  if (!apiKey) return { checkouts: [], transparents: [], tx: [], fontes: {}, warn: null };
 
   const fontes = {};
   let checkouts = [];
   let transparents = [];
+  let warn = null;
 
   try {
     checkouts = await listAll("/checkouts/list", apiKey);
     fontes.checkouts = { total: checkouts.length, pagos: checkouts.filter((x) => isPaid(x.status)).length };
   } catch (e) {
     fontes.checkouts = { erro: e.message };
+    warn = `cartão não respondeu (${e.message})`;
   }
 
   try {
@@ -171,6 +189,8 @@ async function fetchAbacate(apiKey) {
     fontes.transparents = { total: transparents.length, pagos: transparents.filter((x) => isPaid(x.status)).length };
   } catch (e) {
     fontes.transparents = { erro: e.message };
+    // PIX QR é a maior parte da receita: se falhar, avisamos em vez de mostrar número baixo.
+    warn = `PIX QR não respondeu (${e.message}) — receita pode estar incompleta`;
   }
 
   const seen = new Set();
@@ -182,7 +202,7 @@ async function fetchAbacate(apiKey) {
     seen.add(id);
     tx.push({ amount: amountReais(it), date: paidDate(it) });
   }
-  return { checkouts, transparents, tx, fontes };
+  return { checkouts, transparents, tx, fontes, warn };
 }
 
 // ---------- Agregação por marca ----------
@@ -248,11 +268,15 @@ export async function GET(request) {
   if (results[0].status === "fulfilled") gadsRows = results[0].value;
   else errors.push(`Google Ads: ${results[0].reason.message}`);
 
-  if (results[1].status === "fulfilled") abProcesso = results[1].value;
-  else errors.push(`Abacate (Processo): ${results[1].reason.message}`);
+  if (results[1].status === "fulfilled") {
+    abProcesso = results[1].value;
+    if (abProcesso.warn) errors.push(`AbacatePay Processo: ${abProcesso.warn}`);
+  } else errors.push(`Abacate (Processo): ${results[1].reason.message}`);
 
-  if (results[2].status === "fulfilled") abPlaca = results[2].value;
-  else errors.push(`Abacate (Placa): ${results[2].reason.message}`);
+  if (results[2].status === "fulfilled") {
+    abPlaca = results[2].value;
+    if (abPlaca.warn) errors.push(`AbacatePay Placa: ${abPlaca.warn}`);
+  } else errors.push(`Abacate (Placa): ${results[2].reason.message}`);
 
   if (debug === "abacate") {
     return NextResponse.json({
