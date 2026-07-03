@@ -13,6 +13,9 @@ const FETCH_TIMEOUT_MS = 15000;
 // Cache em memória (por instância warm da função): evita rebuscar tudo a cada load
 const CACHE_TTL_MS = 2 * 60 * 1000;
 const memCache = new Map(); // key -> { at, payload }
+// último resultado COMPLETO (sem erros) por janela de datas — usado como
+// fallback quando o Abacate falha, para os números não "desabarem"
+const lastGood = new Map(); // key -> payload
 
 const TZ = "America/Sao_Paulo";
 
@@ -80,21 +83,40 @@ async function fetchGoogleAds(from, to) {
 }
 
 // ---------- AbacatePay ----------
+// A API do Abacate falha de forma intermitente ({"success":false,"data":null}).
+// Retry com backoff: até 3 tentativas antes de desistir.
 async function abFetch(url, apiKey) {
-  const res = await tFetch(url, {
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-  });
-  const text = await res.text();
-  let json = null;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    /* resposta não-JSON */
+  let last = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 500 * 2 ** attempt));
+    try {
+      const res = await tFetch(url, {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+      });
+      const text = await res.text();
+      let json = null;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        /* resposta não-JSON */
+      }
+      const failed = !res.ok || (json && json.success === false);
+      if (!failed) return { res, json, text };
+      last = { res, json, text };
+      // erro de autenticação não se resolve com retry
+      if (res.status === 401 || res.status === 403) break;
+    } catch (e) {
+      last = {
+        res: { ok: false, status: 0 },
+        json: null,
+        text: e?.name === "TimeoutError" ? "timeout na chamada" : String(e?.message || e),
+      };
+    }
   }
-  return { res, json, text };
+  return last;
 }
 
 // converte timestamp (UTC) para a data em America/Sao_Paulo —
@@ -124,8 +146,8 @@ async function listV2(path, paidStatus, apiKey, from) {
     if (after) u.searchParams.set("after", after);
 
     const { res, json, text } = await abFetch(u.toString(), apiKey);
-    if (!res.ok) {
-      const err = new Error(text.slice(0, 200));
+    if (!res.ok || (json && json.success === false)) {
+      const err = new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
       err.status = res.status;
       err.body = text;
       throw err;
@@ -156,8 +178,8 @@ async function listV2(path, paidStatus, apiKey, from) {
 // v1 (chaves antigas): /billing/list devolve tudo; filtramos PAID
 async function listV1Billings(apiKey) {
   const { res, json, text } = await abFetch(`${ABACATE_V1}/billing/list`, apiKey);
-  if (!res.ok) {
-    const err = new Error(text.slice(0, 200));
+  if (!res.ok || (json && json.success === false)) {
+    const err = new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
     err.status = res.status;
     err.body = text;
     throw err;
@@ -353,12 +375,41 @@ export async function GET(request) {
     errors: [...errors, ...warnings],
   };
 
+  const complete = errors.length === 0 && warnings.length === 0;
+
   // só guarda no cache quando tudo carregou (não congela dado incompleto)
-  if (errors.length === 0 && warnings.length === 0) {
+  if (complete) {
     memCache.set(cacheKey, { at: Date.now(), payload });
+    lastGood.set(cacheKey, payload);
+    return NextResponse.json(payload, {
+      headers: { "Cache-Control": "s-maxage=60, stale-while-revalidate=300" },
+    });
   }
 
+  // alguma fonte falhou (mesmo após retries): se temos um resultado completo
+  // anterior desta janela, devolve ele em vez de números incompletos
+  const good = lastGood.get(cacheKey);
+  if (good) {
+    const hora = new Date(good.updatedAt).toLocaleTimeString("pt-BR", {
+      timeZone: TZ,
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    return NextResponse.json(
+      {
+        ...good,
+        stale: true,
+        errors: [
+          `Fontes instáveis agora — mostrando os últimos dados completos (${hora}).`,
+          ...payload.errors,
+        ],
+      },
+      { headers: { "Cache-Control": "no-store" } }
+    );
+  }
+
+  // sem fallback disponível: devolve o que temos, com os avisos
   return NextResponse.json(payload, {
-    headers: { "Cache-Control": "s-maxage=60, stale-while-revalidate=300" },
+    headers: { "Cache-Control": "no-store" },
   });
 }
