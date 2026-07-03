@@ -256,24 +256,49 @@ export async function GET(request) {
   else errors.push(`Abacate (Placa): ${results[2].reason.message}`);
 
   // ---- DEBUG: /api/dashboard?debug=abacate ----
-  // Mostra os dados crus de cada conta para confirmar campos (status, amount, datas).
+  // Levantamento completo: conta registros e pagos em TODAS as fontes do AbacatePay
+  // para descobrir de onde vem a receita real (checkouts, transparentes, links, etc.).
   if (debug === "abacate") {
-    const summarize = (ab) => ({
-      checkouts_total: ab.checkouts.length,
-      checkouts_pagos: ab.checkouts.filter((x) => isPaid(x.status)).length,
-      transparents_total: ab.transparents.length,
-      transparents_pagos: ab.transparents.filter((x) => isPaid(x.status)).length,
-      status_encontrados: [
-        ...new Set([...ab.checkouts, ...ab.transparents].map((x) => x.status)),
-      ],
-      amostra_checkout: ab.checkouts.slice(0, 3),
-      amostra_transparent: ab.transparents.slice(0, 3),
-      tx_normalizadas: ab.tx.slice(0, 10),
-    });
+    const endpoints = [
+      "/checkouts/list",
+      "/transparents/list",
+      "/payment-links/list",
+      "/subscriptions/list",
+      "/pix/list",
+    ];
+
+    async function survey(apiKey) {
+      if (!apiKey) return { erro: "chave não configurada" };
+      const out = {};
+      for (const ep of endpoints) {
+        try {
+          const rows = await listV2(ep, apiKey);
+          const statusSet = [...new Set(rows.map((r) => r.status))];
+          const amountSet = [
+            ...new Set(rows.map((r) => amountReais(r))),
+          ].slice(0, 12);
+          out[ep] = {
+            total: rows.length,
+            status_encontrados: statusSet,
+            valores_reais_distintos: amountSet,
+            amostra: rows.slice(0, 2),
+          };
+        } catch (e) {
+          out[ep] = { erro: e.message };
+        }
+      }
+      return out;
+    }
+
+    const [surveyProcesso, surveyPlaca] = await Promise.all([
+      survey(process.env.ABACATE_KEY_PROCESSO),
+      survey(process.env.ABACATE_KEY_PLACA),
+    ]);
+
     return NextResponse.json({
       period: { from, to },
-      processo: summarize(abProcesso),
-      placa: summarize(abPlaca),
+      processo: surveyProcesso,
+      placa: surveyPlaca,
       errors,
     });
   }
