@@ -87,8 +87,8 @@ async function fetchGoogleAds(from, to) {
 // Retry com backoff: até 3 tentativas antes de desistir.
 async function abFetch(url, apiKey) {
   let last = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (attempt > 0) await new Promise((r) => setTimeout(r, 500 * 2 ** attempt));
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 800 * 2 ** (attempt - 1)));
     try {
       const res = await tFetch(url, {
         headers: {
@@ -205,12 +205,23 @@ async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel) {
     // transferências PIX ENVIADAS (dinheiro saindo), não pagamentos recebidos.
     // Fontes de receita: checkouts, transparents (PIX/Boleto embutido),
     // links de pagamento e assinaturas.
-    const settled = await Promise.allSettled([
-      listV2("/checkouts/list", "PAID", apiKey, from),
-      listV2("/transparents/list", "PAID", apiKey, from),
-      listV2("/payment-links/list", "PAID", apiKey, from),
-      listV2("/subscriptions/list", "PAID", apiKey, from),
-    ]);
+    // Chamadas SEQUENCIAIS (não paralelas) para não estourar o rate limit
+    // do Abacate — as falhas HTTP 400 intermitentes acontecem sob rajada.
+    const paths = [
+      "/checkouts/list",
+      "/transparents/list",
+      "/payment-links/list",
+      "/subscriptions/list",
+    ];
+    const settled = [];
+    for (const p of paths) {
+      settled.push(
+        await listV2(p, "PAID", apiKey, from).then(
+          (value) => ({ status: "fulfilled", value }),
+          (reason) => ({ status: "rejected", reason })
+        )
+      );
+    }
 
     // checkouts é obrigatório; se falhar, propaga (pode ser chave v1)
     if (settled[0].status === "rejected") throw settled[0].reason;
@@ -325,11 +336,20 @@ export async function GET(request) {
   let txProcesso = [];
   let txPlaca = [];
 
-  const results = await Promise.allSettled([
-    fetchGoogleAds(from, to),
-    fetchAbacateTransactions(process.env.ABACATE_KEY_PROCESSO, from, warnings, "Processo"),
-    fetchAbacateTransactions(process.env.ABACATE_KEY_PLACA, from, warnings, "Placa"),
-  ]);
+  // Google Ads em paralelo; marcas do Abacate em SEQUÊNCIA (rate limit)
+  const settle = (p) =>
+    p.then(
+      (value) => ({ status: "fulfilled", value }),
+      (reason) => ({ status: "rejected", reason })
+    );
+  const gadsPromise = settle(fetchGoogleAds(from, to));
+  const rProcesso = await settle(
+    fetchAbacateTransactions(process.env.ABACATE_KEY_PROCESSO, from, warnings, "Processo")
+  );
+  const rPlaca = await settle(
+    fetchAbacateTransactions(process.env.ABACATE_KEY_PLACA, from, warnings, "Placa")
+  );
+  const results = [await gadsPromise, rProcesso, rPlaca];
 
   const label = (r) =>
     r.reason?.name === "TimeoutError"
