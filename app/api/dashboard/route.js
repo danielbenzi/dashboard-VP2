@@ -5,7 +5,7 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 const WINDSOR_BASE = "https://connectors.windsor.ai/google_ads";
-const ABACATE_V1 = "https://api.abacatepay.com/v1";
+const ABACATE_V2 = "https://api.abacatepay.com/v2";
 
 function todayISO() {
   return new Date().toISOString().slice(0, 10);
@@ -60,7 +60,11 @@ async function fetchGoogleAds(from, to) {
   return rows;
 }
 
-// ---------- AbacatePay (API oficial v1) ----------
+// ================= AbacatePay (API v2) =================
+// Base: https://api.abacatepay.com/v2  · valores em CENTAVOS · envelope { data, success, error }
+// RECEITA vem de /checkouts/list (checkout hospedado) e /transparents/list (PIX embutido).
+// /pix/list é TRANSFERÊNCIA DE SAÍDA (não é receita) — não usar.
+
 async function abFetch(url, apiKey) {
   const res = await fetch(url, {
     headers: {
@@ -79,62 +83,106 @@ async function abFetch(url, apiKey) {
   return { res, json, text };
 }
 
-// Valores no AbacatePay são em CENTAVOS (1000 = R$ 10,00).
-// Preferimos o valor efetivamente pago (paidAmount) e caímos para amount.
-function billingAmountCents(b) {
-  if (Number.isFinite(Number(b.paidAmount)) && Number(b.paidAmount) > 0) {
-    return Number(b.paidAmount);
+// Lista paginada de um recurso v2, SEM filtrar por status no servidor
+// (o filtro de pago é feito no cliente, que é mais confiável).
+async function listV2(path, apiKey) {
+  const out = [];
+  let after = null;
+  for (let page = 0; page < 50; page++) {
+    const u = new URL(`${ABACATE_V2}${path}`);
+    u.searchParams.set("limit", "100");
+    if (after) u.searchParams.set("after", after);
+
+    const { res, json, text } = await abFetch(u.toString(), apiKey);
+    if (!res.ok) {
+      const err = new Error(`AbacatePay ${res.status}: ${text.slice(0, 200)}`);
+      err.status = res.status;
+      throw err;
+    }
+
+    // data pode ser array direto ou { data: [...] } / { items: [...] }
+    let items = [];
+    const d = json && json.data;
+    if (Array.isArray(d)) items = d;
+    else if (d && Array.isArray(d.data)) items = d.data;
+    else if (d && Array.isArray(d.items)) items = d.items;
+    else if (Array.isArray(json)) items = json;
+
+    for (const it of items) out.push(it);
+    if (items.length < 100) break;
+
+    const pg = (json && (json.pagination || (json.data && json.data.pagination))) || {};
+    let next = pg.after || pg.nextCursor || pg.cursor || pg.next || null;
+    if (!next && items.length) next = items[items.length - 1].id;
+    if (!next || next === after) break;
+    after = next;
   }
-  if (Number.isFinite(Number(b.amount)) && Number(b.amount) > 0) {
-    return Number(b.amount);
-  }
-  // fallback: soma dos produtos (price em centavos * quantity)
-  if (Array.isArray(b.products)) {
-    return b.products.reduce(
-      (s, p) => s + num(p.price) * (num(p.quantity) || 1),
-      0
-    );
-  }
-  return 0;
+  return out;
 }
 
-// data em que a cobrança foi paga (para encaixar no período)
-function billingPaidDate(b) {
-  return String(
-    b.paidAt || b.paid_at || b.updatedAt || b.updated_at || b.createdAt || b.created_at || ""
-  ).slice(0, 10);
-}
-
-// Considera pago tanto "PAID" quanto "COMPLETE"/"COMPLETED" (PIX/transparent)
-function isPaidStatus(status) {
+function isPaid(status) {
   const s = String(status || "").toUpperCase();
   return s === "PAID" || s === "COMPLETE" || s === "COMPLETED";
 }
 
-// Busca TODAS as cobranças da conta via v1 /billing/list e mantém só as pagas.
-// Retorna { rows: [...brutos pagos], tx: [{ amount: reais, date }] }
-async function fetchAbacate(apiKey) {
-  if (!apiKey) return { rows: [], tx: [] };
-
-  const { res, json, text } = await abFetch(`${ABACATE_V1}/billing/list`, apiKey);
-  if (!res.ok) {
-    const err = new Error(`AbacatePay ${res.status}: ${text.slice(0, 200)}`);
-    err.status = res.status;
-    throw err;
+// valor pago em CENTAVOS -> reais
+function amountReais(it) {
+  const cands = [it.paidAmount, it.amount, it.value, it.total];
+  for (const c of cands) {
+    const n = Number(c);
+    if (Number.isFinite(n) && n > 0) return n / 100;
   }
+  // fallback: soma de products/items (price em centavos * quantity)
+  const list = Array.isArray(it.products)
+    ? it.products
+    : Array.isArray(it.items)
+    ? it.items
+    : [];
+  const sum = list.reduce(
+    (s, p) => s + num(p.price ?? p.amount) * (num(p.quantity) || 1),
+    0
+  );
+  return sum / 100;
+}
 
-  const items = (json && json.data) || [];
-  const paid = items.filter((b) => isPaidStatus(b.status));
-  const tx = paid.map((b) => ({
-    amount: billingAmountCents(b) / 100,
-    date: billingPaidDate(b),
-  }));
-  return { rows: paid, tx };
+// data do pagamento
+function paidDate(it) {
+  return String(
+    it.paidAt ||
+      it.paid_at ||
+      it.completedAt ||
+      it.updatedAt ||
+      it.updated_at ||
+      it.createdAt ||
+      it.created_at ||
+      ""
+  ).slice(0, 10);
+}
+
+// Busca receita (checkouts + transparents) de uma conta e normaliza as pagas.
+async function fetchAbacate(apiKey) {
+  if (!apiKey) return { checkouts: [], transparents: [], tx: [] };
+
+  const [checkouts, transparents] = await Promise.all([
+    listV2("/checkouts/list", apiKey),
+    listV2("/transparents/list", apiKey).catch(() => []),
+  ]);
+
+  const seen = new Set();
+  const tx = [];
+  for (const it of [...checkouts, ...transparents]) {
+    if (!isPaid(it.status)) continue;
+    const id = it.id || JSON.stringify(it);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    tx.push({ amount: amountReais(it), date: paidDate(it) });
+  }
+  return { checkouts, transparents, tx };
 }
 
 // ---------- Agregação por marca ----------
 function buildBrand(name, gadsRows, abacateTx, from, to) {
-  const daily = {}; // date -> { spend, revenue, transactions }
+  const daily = {};
   let spend = 0,
     clicks = 0,
     impressions = 0,
@@ -168,24 +216,13 @@ function buildBrand(name, gadsRows, abacateTx, from, to) {
   }
 
   const series = Object.values(daily).sort((a, b) => (a.date < b.date ? -1 : 1));
-
   const cpa = transactions > 0 ? spend / transactions : null;
   const roas = spend > 0 ? revenue / spend : null;
   const ticket = transactions > 0 ? revenue / transactions : null;
 
   return {
-    name,
-    spend,
-    revenue,
-    transactions,
-    cpa,
-    roas,
-    ticket,
-    clicks,
-    impressions,
-    gadsConversions,
-    gadsConvValue,
-    series,
+    name, spend, revenue, transactions, cpa, roas, ticket,
+    clicks, impressions, gadsConversions, gadsConvValue, series,
   };
 }
 
@@ -200,8 +237,8 @@ export async function GET(request) {
 
   const errors = [];
   let gadsRows = [];
-  let abProcesso = { rows: [], tx: [] };
-  let abPlaca = { rows: [], tx: [] };
+  let abProcesso = { checkouts: [], transparents: [], tx: [] };
+  let abPlaca = { checkouts: [], transparents: [], tx: [] };
 
   const results = await Promise.allSettled([
     fetchGoogleAds(from, to),
@@ -218,22 +255,25 @@ export async function GET(request) {
   if (results[2].status === "fulfilled") abPlaca = results[2].value;
   else errors.push(`Abacate (Placa): ${results[2].reason.message}`);
 
-  // ---- Modo debug: expõe os registros brutos do AbacatePay para conferência ----
-  // Acesse /api/dashboard?debug=abacate para ver os campos reais (status, amount,
-  // paidAmount, frequency, datas) e confirmar de onde vem a receita.
+  // ---- DEBUG: /api/dashboard?debug=abacate ----
+  // Mostra os dados crus de cada conta para confirmar campos (status, amount, datas).
   if (debug === "abacate") {
+    const summarize = (ab) => ({
+      checkouts_total: ab.checkouts.length,
+      checkouts_pagos: ab.checkouts.filter((x) => isPaid(x.status)).length,
+      transparents_total: ab.transparents.length,
+      transparents_pagos: ab.transparents.filter((x) => isPaid(x.status)).length,
+      status_encontrados: [
+        ...new Set([...ab.checkouts, ...ab.transparents].map((x) => x.status)),
+      ],
+      amostra_checkout: ab.checkouts.slice(0, 3),
+      amostra_transparent: ab.transparents.slice(0, 3),
+      tx_normalizadas: ab.tx.slice(0, 10),
+    });
     return NextResponse.json({
       period: { from, to },
-      processo: {
-        totalPagas: abProcesso.rows.length,
-        amostra: abProcesso.rows.slice(0, 5),
-        tx: abProcesso.tx.slice(0, 10),
-      },
-      placa: {
-        totalPagas: abPlaca.rows.length,
-        amostra: abPlaca.rows.slice(0, 5),
-        tx: abPlaca.tx.slice(0, 10),
-      },
+      processo: summarize(abProcesso),
+      placa: summarize(abPlaca),
       errors,
     });
   }
@@ -243,7 +283,6 @@ export async function GET(request) {
     buildBrand(namePlaca, gadsRows, abPlaca.tx, from, to),
   ];
 
-  // total consolidado
   const merged = {};
   for (const br of brands) {
     for (const p of br.series) {
