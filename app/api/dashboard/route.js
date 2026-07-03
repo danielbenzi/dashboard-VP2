@@ -5,7 +5,6 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 const WINDSOR_BASE = "https://connectors.windsor.ai/google_ads";
-const ABACATE_V2 = "https://api.abacatepay.com/v2";
 const ABACATE_V1 = "https://api.abacatepay.com/v1";
 
 function todayISO() {
@@ -61,7 +60,7 @@ async function fetchGoogleAds(from, to) {
   return rows;
 }
 
-// ---------- AbacatePay ----------
+// ---------- AbacatePay (API oficial v1) ----------
 async function abFetch(url, apiKey) {
   const res = await fetch(url, {
     headers: {
@@ -80,95 +79,60 @@ async function abFetch(url, apiKey) {
   return { res, json, text };
 }
 
-// transforma um item (v2 ou v1) em { amount: reais, date: 'YYYY-MM-DD' }
-function normalizeTx(it) {
-  const date = String(it.paidAt || it.createdAt || it.created_at || it.updatedAt || "").slice(
-    0,
-    10
-  );
-  return { amount: num(it.amount) / 100, date };
-}
-
-// lista paginada de um recurso v2 já filtrando pelo status pago
-async function listV2(path, paidStatus, apiKey) {
-  const out = [];
-  let after = null;
-  for (let page = 0; page < 50; page++) {
-    const u = new URL(`${ABACATE_V2}${path}`);
-    u.searchParams.set("limit", "100");
-    u.searchParams.set("status", paidStatus);
-    if (after) u.searchParams.set("after", after);
-
-    const { res, json, text } = await abFetch(u.toString(), apiKey);
-    if (!res.ok) {
-      const err = new Error(text.slice(0, 200));
-      err.status = res.status;
-      err.body = text;
-      throw err;
-    }
-    const items = (json && json.data) || [];
-    for (const it of items) out.push(it);
-
-    if (items.length < 100) break;
-
-    // descobre o cursor da próxima página
-    const pg = (json && json.pagination) || {};
-    let next =
-      pg.after || pg.nextCursor || pg.cursor || pg.next || null;
-    if (!next && items[items.length - 1]) next = items[items.length - 1].id;
-    if (!next || next === after) break;
-    after = next;
+// Valores no AbacatePay são em CENTAVOS (1000 = R$ 10,00).
+// Preferimos o valor efetivamente pago (paidAmount) e caímos para amount.
+function billingAmountCents(b) {
+  if (Number.isFinite(Number(b.paidAmount)) && Number(b.paidAmount) > 0) {
+    return Number(b.paidAmount);
   }
-  return out;
+  if (Number.isFinite(Number(b.amount)) && Number(b.amount) > 0) {
+    return Number(b.amount);
+  }
+  // fallback: soma dos produtos (price em centavos * quantity)
+  if (Array.isArray(b.products)) {
+    return b.products.reduce(
+      (s, p) => s + num(p.price) * (num(p.quantity) || 1),
+      0
+    );
+  }
+  return 0;
 }
 
-// v1 (chaves antigas): /billing/list devolve tudo; filtramos PAID
-async function listV1Billings(apiKey) {
+// data em que a cobrança foi paga (para encaixar no período)
+function billingPaidDate(b) {
+  return String(
+    b.paidAt || b.paid_at || b.updatedAt || b.updated_at || b.createdAt || b.created_at || ""
+  ).slice(0, 10);
+}
+
+// Considera pago tanto "PAID" quanto "COMPLETE"/"COMPLETED" (PIX/transparent)
+function isPaidStatus(status) {
+  const s = String(status || "").toUpperCase();
+  return s === "PAID" || s === "COMPLETE" || s === "COMPLETED";
+}
+
+// Busca TODAS as cobranças da conta via v1 /billing/list e mantém só as pagas.
+// Retorna { rows: [...brutos pagos], tx: [{ amount: reais, date }] }
+async function fetchAbacate(apiKey) {
+  if (!apiKey) return { rows: [], tx: [] };
+
   const { res, json, text } = await abFetch(`${ABACATE_V1}/billing/list`, apiKey);
   if (!res.ok) {
-    const err = new Error(text.slice(0, 200));
+    const err = new Error(`AbacatePay ${res.status}: ${text.slice(0, 200)}`);
     err.status = res.status;
-    err.body = text;
     throw err;
   }
+
   const items = (json && json.data) || [];
-  return items.filter((b) => String(b.status).toUpperCase() === "PAID");
+  const paid = items.filter((b) => isPaidStatus(b.status));
+  const tx = paid.map((b) => ({
+    amount: billingAmountCents(b) / 100,
+    date: billingPaidDate(b),
+  }));
+  return { rows: paid, tx };
 }
 
-// Busca as transações pagas de uma marca. Tenta v2; se a chave for v1, cai para v1.
-// Retorna array normalizado [{ amount: reais, date }].
-async function fetchAbacateTransactions(apiKey) {
-  if (!apiKey) return [];
-
-  // ---- tentativa v2 ----
-  try {
-    const [checkouts, transparents, pix] = await Promise.all([
-      listV2("/checkouts/list", "PAID", apiKey),
-      listV2("/transparents/list", "PAID", apiKey).catch(() => []),
-      listV2("/pix/list", "COMPLETE", apiKey).catch(() => []),
-    ]);
-
-    // junta tudo, deduplica por id (um pagamento vive em um só recurso)
-    const seen = new Set();
-    const all = [];
-    for (const it of [...checkouts, ...transparents, ...pix]) {
-      const id = it.id || JSON.stringify(it);
-      if (seen.has(id)) continue;
-      seen.add(id);
-      all.push(normalizeTx(it));
-    }
-    return all;
-  } catch (e) {
-    const isVersionMismatch =
-      /version mismatch/i.test(e.body || e.message || "") || e.status === 401;
-    if (!isVersionMismatch) throw e;
-    // ---- fallback v1 ----
-    const billings = await listV1Billings(apiKey);
-    return billings.map(normalizeTx);
-  }
-}
-
-// agrega uma marca: junta gasto (Google) + receita/transações (Abacate)
+// ---------- Agregação por marca ----------
 function buildBrand(name, gadsRows, abacateTx, from, to) {
   const daily = {}; // date -> { spend, revenue, transactions }
   let spend = 0,
@@ -229,33 +193,54 @@ export async function GET(request) {
   const { searchParams } = new URL(request.url);
   const from = searchParams.get("from") || firstOfMonthISO();
   const to = searchParams.get("to") || todayISO();
+  const debug = searchParams.get("debug");
 
   const nameProcesso = process.env.GADS_ACCOUNT_PROCESSO || "Verifica Processo";
   const namePlaca = process.env.GADS_ACCOUNT_PLACA || "Verifica Placa";
 
   const errors = [];
   let gadsRows = [];
-  let txProcesso = [];
-  let txPlaca = [];
+  let abProcesso = { rows: [], tx: [] };
+  let abPlaca = { rows: [], tx: [] };
 
   const results = await Promise.allSettled([
     fetchGoogleAds(from, to),
-    fetchAbacateTransactions(process.env.ABACATE_KEY_PROCESSO),
-    fetchAbacateTransactions(process.env.ABACATE_KEY_PLACA),
+    fetchAbacate(process.env.ABACATE_KEY_PROCESSO),
+    fetchAbacate(process.env.ABACATE_KEY_PLACA),
   ]);
 
   if (results[0].status === "fulfilled") gadsRows = results[0].value;
   else errors.push(`Google Ads: ${results[0].reason.message}`);
 
-  if (results[1].status === "fulfilled") txProcesso = results[1].value;
+  if (results[1].status === "fulfilled") abProcesso = results[1].value;
   else errors.push(`Abacate (Processo): ${results[1].reason.message}`);
 
-  if (results[2].status === "fulfilled") txPlaca = results[2].value;
+  if (results[2].status === "fulfilled") abPlaca = results[2].value;
   else errors.push(`Abacate (Placa): ${results[2].reason.message}`);
 
+  // ---- Modo debug: expõe os registros brutos do AbacatePay para conferência ----
+  // Acesse /api/dashboard?debug=abacate para ver os campos reais (status, amount,
+  // paidAmount, frequency, datas) e confirmar de onde vem a receita.
+  if (debug === "abacate") {
+    return NextResponse.json({
+      period: { from, to },
+      processo: {
+        totalPagas: abProcesso.rows.length,
+        amostra: abProcesso.rows.slice(0, 5),
+        tx: abProcesso.tx.slice(0, 10),
+      },
+      placa: {
+        totalPagas: abPlaca.rows.length,
+        amostra: abPlaca.rows.slice(0, 5),
+        tx: abPlaca.tx.slice(0, 10),
+      },
+      errors,
+    });
+  }
+
   const brands = [
-    buildBrand(nameProcesso, gadsRows, txProcesso, from, to),
-    buildBrand(namePlaca, gadsRows, txPlaca, from, to),
+    buildBrand(nameProcesso, gadsRows, abProcesso.tx, from, to),
+    buildBrand(namePlaca, gadsRows, abPlaca.tx, from, to),
   ];
 
   // total consolidado
