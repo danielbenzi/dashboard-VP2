@@ -97,10 +97,14 @@ async function abFetch(url, apiKey) {
   return { res, json, text };
 }
 
+// converte timestamp (UTC) para a data em America/Sao_Paulo —
+// venda das 22h BRT não pode cair no dia seguinte
 function txDate(it) {
-  return String(
-    it.paidAt || it.createdAt || it.created_at || it.updatedAt || ""
-  ).slice(0, 10);
+  const raw = it.paidAt || it.createdAt || it.created_at || it.updatedAt || "";
+  if (!raw) return "";
+  const d = new Date(raw);
+  if (isNaN(d)) return String(raw).slice(0, 10);
+  return d.toLocaleDateString("en-CA", { timeZone: TZ });
 }
 
 // transforma um item (v2 ou v1) em { amount: reais, date: 'YYYY-MM-DD' }
@@ -169,16 +173,18 @@ async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel) {
   if (!apiKey) return [];
 
   try {
+    // Obs.: /pix/list NÃO entra aqui — na API do Abacate ele lista
+    // transferências PIX ENVIADAS (dinheiro saindo), não pagamentos recebidos.
+    // PIX recebido já aparece em checkouts e transparents.
     const settled = await Promise.allSettled([
       listV2("/checkouts/list", "PAID", apiKey, from),
       listV2("/transparents/list", "PAID", apiKey, from),
-      listV2("/pix/list", "COMPLETE", apiKey, from),
     ]);
 
     // checkouts é obrigatório; se falhar, propaga (pode ser chave v1)
     if (settled[0].status === "rejected") throw settled[0].reason;
 
-    const labels = ["checkouts", "transparents", "pix"];
+    const labels = ["checkouts", "transparents"];
     const lists = [];
     settled.forEach((r, i) => {
       if (r.status === "fulfilled") lists.push(r.value);
