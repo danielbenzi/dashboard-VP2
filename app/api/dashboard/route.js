@@ -262,51 +262,75 @@ export async function GET(request) {
   else errors.push(`Abacate (Placa): ${results[2].reason.message}`);
 
   // ---- DEBUG: /api/dashboard?debug=abacate ----
-  // Levantamento completo: conta registros e pagos em TODAS as fontes do AbacatePay
-  // para descobrir de onde vem a receita real (checkouts, transparentes, links, etc.).
+  // Testa variações das chamadas para descobrir a forma correta de listar
+  // (principalmente /transparents/list, que estava dando 400) e o formato de paginação.
   if (debug === "abacate") {
-    const endpoints = [
-      "/checkouts/list",
-      "/transparents/list",
-      "/payment-links/list",
-      "/subscriptions/list",
-      "/pix/list",
-    ];
+    async function rawGet(path, apiKey) {
+      const { res, json, text } = await abFetch(`${ABACATE_V2}${path}`, apiKey);
+      let dataLen = null;
+      let pagination = null;
+      let firstItem = null;
+      if (json) {
+        const d = json.data;
+        const arr = Array.isArray(d)
+          ? d
+          : d && Array.isArray(d.data)
+          ? d.data
+          : d && Array.isArray(d.items)
+          ? d.items
+          : Array.isArray(json)
+          ? json
+          : null;
+        if (arr) {
+          dataLen = arr.length;
+          if (arr[0])
+            firstItem = {
+              id: arr[0].id,
+              status: arr[0].status,
+              amount: arr[0].amount,
+              paidAmount: arr[0].paidAmount,
+              methods: arr[0].methods || arr[0].method,
+            };
+        }
+        pagination =
+          json.pagination || (json.data && json.data.pagination) || null;
+      }
+      return {
+        status: res.status,
+        ok: res.ok,
+        dataLen,
+        pagination,
+        firstItem,
+        bodySnippet: text.slice(0, 200),
+      };
+    }
 
-    async function survey(apiKey) {
+    async function probe(apiKey) {
       if (!apiKey) return { erro: "chave não configurada" };
+      const paths = [
+        "/checkouts/list",
+        "/checkouts/list?limit=100",
+        "/transparents/list",
+        "/transparents/list?limit=25",
+        "/transparents/list?limit=50",
+        "/transparents/list?limit=100",
+      ];
       const out = {};
-      for (const ep of endpoints) {
+      for (const p of paths) {
         try {
-          const rows = await listV2(ep, apiKey);
-          const statusSet = [...new Set(rows.map((r) => r.status))];
-          const amountSet = [
-            ...new Set(rows.map((r) => amountReais(r))),
-          ].slice(0, 12);
-          out[ep] = {
-            total: rows.length,
-            status_encontrados: statusSet,
-            valores_reais_distintos: amountSet,
-            amostra: rows.slice(0, 2),
-          };
+          out[p] = await rawGet(p, apiKey);
         } catch (e) {
-          out[ep] = { erro: e.message };
+          out[p] = { erro: e.message };
         }
       }
       return out;
     }
 
-    const [surveyProcesso, surveyPlaca] = await Promise.all([
-      survey(process.env.ABACATE_KEY_PROCESSO),
-      survey(process.env.ABACATE_KEY_PLACA),
+    const [probeProcesso] = await Promise.all([
+      probe(process.env.ABACATE_KEY_PROCESSO),
     ]);
 
-    return NextResponse.json({
-      period: { from, to },
-      processo: surveyProcesso,
-      placa: surveyPlaca,
-      errors,
-    });
+    return NextResponse.json({ period: { from, to }, processo: probeProcesso, errors });
   }
 
   const brands = [
