@@ -68,13 +68,7 @@ async function fetchGoogleAds(from, to) {
   const url =
     `${WINDSOR_BASE}?api_key=${encodeURIComponent(key)}` +
     `&date_from=${from}&date_to=${to}` +
-    `&fields=${fields}` +
-    // Sem esses parâmetros o Windsor devolve cache de até ~6h. Com eles,
-    // cada carga do dashboard pede ao Windsor que re-busque do Google Ads
-    // os últimos 3 dias — respeitando o mínimo do plano:
-    // 15min (Professional/Enterprise) | 1h (Standard/Plus).
-    // Se o Windsor retornar erro por causa do plano, troque 15min por 1h.
-    `&refresh_since=3d&refresh_interval=15min`;
+    `&fields=${fields}`;
 
   const res = await tFetch(url);
   if (!res.ok) {
