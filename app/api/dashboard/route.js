@@ -9,6 +9,17 @@ const ABACATE_V2 = "https://api.abacatepay.com/v2";
 const ABACATE_V1 = "https://api.abacatepay.com/v1";
 const STRIPE_BASE = "https://api.stripe.com/v1";
 
+// O Windsor guarda a resposta de CADA URL de conector por 6 HORAS. Sem pedir
+// refresh, um plano com atualização horária não adianta nada: a chamada volta
+// do cache com dado velho. `refresh_interval` define de quanto em quanto tempo
+// ele rebusca da origem e `refresh_since` a janela recente reprocessada.
+// Ex.: ...&refresh_since=3d&refresh_interval=1h
+const WINDSOR_REFRESH_INTERVAL = process.env.WINDSOR_REFRESH_INTERVAL || "1h";
+const WINDSOR_REFRESH_SINCE = process.env.WINDSOR_REFRESH_SINCE || "3d";
+const WINDSOR_REFRESH =
+  `&refresh_since=${encodeURIComponent(WINDSOR_REFRESH_SINCE)}` +
+  `&refresh_interval=${encodeURIComponent(WINDSOR_REFRESH_INTERVAL)}`;
+
 // Timeout por chamada externa. O Abacate às vezes passa de 8s para responder;
 // como o orçamento global já protege a rota do 504, dá para ser mais paciente
 // aqui do que seria seguro sem ele.
@@ -127,7 +138,8 @@ async function fetchGoogleAds(from, to, budget) {
   const url =
     `${WINDSOR_BASE}?api_key=${encodeURIComponent(key)}` +
     `&date_from=${from}&date_to=${to}` +
-    `&fields=${fields}`;
+    `&fields=${fields}` +
+    WINDSOR_REFRESH;
 
   const res = await tFetch(url, {}, budget);
   if (!res.ok) {
@@ -155,7 +167,8 @@ async function fetchGoogleAdsHourly(day, budget) {
   const url =
     `${WINDSOR_BASE}?api_key=${encodeURIComponent(key)}` +
     `&date_from=${day}&date_to=${day}` +
-    `&fields=${fields}`;
+    `&fields=${fields}` +
+    WINDSOR_REFRESH;
 
   const res = await tFetch(url, {}, budget);
   if (!res.ok) {
