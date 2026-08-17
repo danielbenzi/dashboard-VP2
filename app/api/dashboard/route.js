@@ -374,10 +374,14 @@ async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel, budg
 
     // derivado de paths: "/payment-links/list" -> "payment-links"
     const labels = paths.map((p) => p.split("/").filter(Boolean)[0] || p);
-    const lists = [];
+    // cada transação carrega de QUAL endpoint veio, para o dashboard poder
+    // mostrar a receita por fonte — sem isso não dá para saber se um número
+    // baixo é venda fraca ou fonte faltando.
+    const tagged = [];
     settled.forEach((r, i) => {
-      if (r.status === "fulfilled") lists.push(r.value);
-      else
+      if (r.status === "fulfilled") {
+        for (const it of r.value) tagged.push({ it, source: `Abacate/${labels[i]}` });
+      } else
         warnings.push(
           `Abacate (${brandLabel}/${labels[i]}): ${r.reason?.message || r.reason}`
         );
@@ -385,11 +389,11 @@ async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel, budg
 
     const seen = new Set();
     const all = [];
-    for (const it of lists.flat()) {
+    for (const { it, source } of tagged) {
       const id = it.id || JSON.stringify(it);
       if (seen.has(id)) continue;
       seen.add(id);
-      all.push(normalizeTx(it));
+      all.push({ ...normalizeTx(it), source });
     }
     return all;
   } catch (e) {
@@ -459,6 +463,7 @@ async function fetchStripeTransactions(apiKey, from, to, warnings, brandLabel, b
         date: new Date(num(ch.created) * 1000).toLocaleDateString("en-CA", {
           timeZone: TZ,
         }),
+        source: "Stripe",
       });
     }
 
@@ -508,15 +513,23 @@ function buildBrand(name, gadsRows, abacateTx, from, to) {
 
   let revenue = 0,
     transactions = 0;
+  // quanto cada fonte trouxe: é isso que revela se um número baixo é venda
+  // fraca ou fonte faltando/desligada
+  const bySource = {};
   for (const t of abacateTx) {
     if (!inRange(t.date, from, to)) continue;
     revenue += t.amount;
     transactions += 1;
+    const s = t.source || "desconhecido";
+    if (!bySource[s]) bySource[s] = { source: s, revenue: 0, transactions: 0 };
+    bySource[s].revenue += t.amount;
+    bySource[s].transactions += 1;
     if (!daily[t.date])
       daily[t.date] = { date: t.date, spend: 0, revenue: 0, transactions: 0 };
     daily[t.date].revenue += t.amount;
     daily[t.date].transactions += 1;
   }
+  const sources = Object.values(bySource).sort((a, b) => b.revenue - a.revenue);
 
   const series = Object.values(daily).sort((a, b) => (a.date < b.date ? -1 : 1));
 
@@ -537,6 +550,7 @@ function buildBrand(name, gadsRows, abacateTx, from, to) {
     gadsConversions,
     gadsConvValue,
     series,
+    sources,
   };
 }
 
@@ -653,7 +667,14 @@ export async function GET(request) {
 
   // total consolidado
   const merged = {};
+  const mergedSources = {};
   for (const br of brands) {
+    for (const s of br.sources || []) {
+      if (!mergedSources[s.source])
+        mergedSources[s.source] = { source: s.source, revenue: 0, transactions: 0 };
+      mergedSources[s.source].revenue += s.revenue;
+      mergedSources[s.source].transactions += s.transactions;
+    }
     for (const p of br.series) {
       if (!merged[p.date])
         merged[p.date] = { date: p.date, spend: 0, revenue: 0, transactions: 0 };
@@ -675,6 +696,7 @@ export async function GET(request) {
     roas: totalSpend > 0 ? totalRevenue / totalSpend : null,
     ticket: totalTx > 0 ? totalRevenue / totalTx : null,
     series: Object.values(merged).sort((a, b) => (a.date < b.date ? -1 : 1)),
+    sources: Object.values(mergedSources).sort((a, b) => b.revenue - a.revenue),
   };
 
   const payload = {
