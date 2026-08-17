@@ -20,14 +20,19 @@ const FETCH_TIMEOUT_MS = 12000;
 const BUDGET_MS = Number(process.env.DASHBOARD_BUDGET_MS || 50000);
 // Tentativas por chamada ao Abacate (a API falha de forma intermitente)
 const MAX_ATTEMPTS = 3;
-// Teto de páginas por listagem
-const MAX_PAGES = 30;
-// Registros por página do Abacate. Página menor responde mais rápido (o
-// timeout na página 2 com limit=100 foi o que zerava a receita do Abacate),
-// ao custo de mais idas e voltas. Ajustável sem mexer no código.
+// Teto de páginas por listagem. Com startDate/endDate a API devolve só o
+// período pedido, mas o volume real (~6.5 mil transações/mês) ainda exige
+// dezenas de páginas — o orçamento de tempo é quem corta de verdade.
+const MAX_PAGES = 120;
+// Registros por página. A API aceita até 100 (QueryLimit: minimum 1,
+// maximum 100), e menos páginas significa menos idas e voltas.
 const ABACATE_PAGE_LIMIT = String(
-  Number(process.env.ABACATE_PAGE_LIMIT) || 50
+  Math.min(100, Math.max(1, Number(process.env.ABACATE_PAGE_LIMIT) || 100))
 );
+// startDate filtra por data de CRIAÇÃO, mas o dashboard conta pela data de
+// PAGAMENTO: um checkout criado dia 30 e pago dia 2 precisa entrar. Buscamos
+// alguns dias antes da janela e filtramos pela data de pagamento no código.
+const ABACATE_LOOKBACK_DAYS = Number(process.env.ABACATE_LOOKBACK_DAYS || 7);
 // Endpoints de receita do Abacate, na ordem de prioridade (o primeiro é o
 // obrigatório). Sobrescrevível por ABACATE_ENDPOINTS para desligar produtos
 // que a conta não usa e que respondem 400 permanentemente.
@@ -62,6 +67,13 @@ function firstOfMonthISO() {
 function num(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
+}
+
+// desloca uma data YYYY-MM-DD em N dias (meio-dia evita borda de fuso)
+function shiftDays(dateStr, days) {
+  const d = new Date(`${dateStr}T12:00:00-03:00`);
+  d.setDate(d.getDate() + days);
+  return d.toLocaleDateString("en-CA", { timeZone: TZ });
 }
 
 function inRange(dateStr, from, to) {
@@ -225,14 +237,14 @@ function normalizeTx(it) {
   return { amount: num(cents) / 100, date: txDate(it) };
 }
 
-// lista paginada de um recurso v2, com parada antecipada quando as páginas
-// já são todas anteriores a `from` (evita varrer o histórico inteiro).
-// Se a API rejeitar o filtro ?status= com HTTP 400 (acontece de forma
-// intermitente), refaz a listagem SEM o filtro e filtra aqui no código.
-async function listV2(path, paidStatus, apiKey, from, budget, onTruncate, useStatusParam = true) {
+// lista paginada de um recurso v2, com filtro de data no servidor.
+// Se a API rejeitar o filtro ?status= com HTTP 400/422, refaz a listagem SEM
+// o filtro e filtra aqui no código.
+async function listV2(path, paidStatus, apiKey, from, to, budget, onTruncate, useStatusParam = true) {
   const out = [];
   let after = null;
   let truncated = true; // vira false assim que a paginação terminar naturalmente
+  let truncReason = null; // motivo do corte, quando não for o teto de páginas
   let page = 0;
 
   // Falha no MEIO da paginação não pode descartar o que já foi lido: as páginas
@@ -259,6 +271,11 @@ async function listV2(path, paidStatus, apiKey, from, budget, onTruncate, useSta
     const u = new URL(`${ABACATE_V2}${path}`);
     u.searchParams.set("limit", ABACATE_PAGE_LIMIT);
     if (useStatusParam) u.searchParams.set("status", paidStatus);
+    // Filtro de data NO SERVIDOR — sem ele a API varre o histórico inteiro a
+    // cada página, que era o motivo real da lentidão. O intervalo já é
+    // interpretado em America/Sao_Paulo, o mesmo fuso do dashboard.
+    if (from) u.searchParams.set("startDate", shiftDays(from, -ABACATE_LOOKBACK_DAYS));
+    if (to) u.searchParams.set("endDate", to);
     if (after) u.searchParams.set("after", after);
 
     const { res, json, text } = await abFetch(u.toString(), apiKey, budget);
@@ -269,7 +286,7 @@ async function listV2(path, paidStatus, apiKey, from, budget, onTruncate, useSta
       // Em qualquer um dos casos o plano B é o mesmo: listar sem o filtro.
       if ((res.status === 400 || res.status === 422) && useStatusParam) {
         // plano B: lista sem o filtro de status e filtra client-side
-        return listV2(path, paidStatus, apiKey, from, budget, onTruncate, false);
+        return listV2(path, paidStatus, apiKey, from, to, budget, onTruncate, false);
       }
       // se já estamos SEM o filtro de status, é porque o plano B também falhou:
       // deixar isso explícito evita diagnosticar como erro simples de filtro.
@@ -287,41 +304,34 @@ async function listV2(path, paidStatus, apiKey, from, budget, onTruncate, useSta
       : raw.filter((it) => String(it.status).toUpperCase() === paidStatus);
     for (const it of items) out.push(it);
 
-    // Paginação: a doc promete pagination: { hasMore, next }, mas na prática
-    // a API nem sempre devolve esses campos. Regra: se a página veio CHEIA,
-    // assume que há mais; cursor = pagination.next ou, na falta dele, o id do
-    // último item.
+    // Paginação por cursor, conforme a especificação: `pagination.hasMore` diz
+    // se há mais e `pagination.next` é o cursor (publicId) para `after` — os
+    // dois são campos obrigatórios da resposta. O id do último item NÃO é
+    // cursor válido; usá-lo como palpite parava a paginação cedo.
     const pg = (json && json.pagination) || {};
     const fullPage = raw.length >= Number(ABACATE_PAGE_LIMIT);
-    if (!fullPage && pg.hasMore !== true) {
+    if (pg.hasMore === false || (pg.hasMore == null && !fullPage)) {
       truncated = false;
       break;
     }
 
-    // parada antecipada: se a lista vem em ordem decrescente de data e o item
-    // MAIS ANTIGO desta página já é anterior a `from`, as próximas páginas são
-    // todas anteriores também (os itens úteis desta página já foram coletados).
-    if (from && raw.length > 1) {
-      const dFirst = txDate(raw[0]);
-      const dLast = txDate(raw[raw.length - 1]);
-      const descending = dFirst >= dLast;
-      if (descending && dLast && dLast < from) {
-        truncated = false;
-        break;
-      }
-    }
-
-    let next = pg.next || pg.after || null;
-    if (!next && raw.length > 0) next = raw[raw.length - 1].id;
+    const next = pg.next || null;
     if (!next || next === after) {
-      truncated = false;
+      // Página CHEIA sem cursor de continuação é suspeito: provavelmente há
+      // mais dados que não conseguimos alcançar. Não marcar como completo —
+      // silêncio aqui vira receita faltando sem ninguém perceber.
+      truncated = fullPage;
+      if (fullPage) {
+        truncReason =
+          "a API devolveu uma página cheia sem cursor de próxima página (pagination.next)";
+      }
       break;
     }
     after = next;
   }
   // bateu no teto de páginas: há mais dados que não foram lidos. Isso NÃO pode
   // passar em silêncio — a receita sairia menor sem ninguém perceber.
-  if (truncated && onTruncate) onTruncate(path, out.length);
+  if (truncated && onTruncate) onTruncate(path, out.length, truncReason);
   return out;
 }
 
@@ -339,30 +349,21 @@ async function listV1Billings(apiKey, budget) {
 }
 
 // Busca as transações pagas de uma marca. Tenta v2; se a chave for v1, cai para v1.
-// Erros parciais (transparents/pix) NÃO são engolidos: vão para `warnings`,
-// para o dashboard nunca mostrar receita menor silenciosamente.
-async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel, budget) {
+// Erros parciais NÃO são engolidos: vão para `warnings`, para o dashboard nunca
+// mostrar receita menor silenciosamente.
+async function fetchAbacateTransactions(apiKey, from, to, warnings, brandLabel, budget) {
   if (!apiKey) return [];
 
   try {
     // Obs.: /pix/list NÃO entra aqui — na API do Abacate ele lista
     // transferências PIX ENVIADAS (dinheiro saindo), não pagamentos recebidos.
-    // Fontes de receita: checkouts, transparents (PIX/Boleto embutido),
-    // links de pagamento e assinaturas.
-    // Chamadas SEQUENCIAIS (não paralelas) para não estourar o rate limit
-    // do Abacate — as falhas HTTP 400 intermitentes acontecem sob rajada.
-    // Configurável: nem toda conta usa todos os produtos do Abacate, e um
-    // endpoint que a conta não tem responde HTTP 400 para sempre — vira ruído
-    // permanente no dashboard. Para desligar, defina ABACATE_ENDPOINTS com a
-    // lista separada por vírgula. O primeiro da lista é tratado como o
-    // obrigatório. Ex.: "/checkouts/list,/payment-links/list"
+    // Chamadas SEQUENCIAIS (não paralelas) para não estourar o rate limit.
+    // Configurável por ABACATE_ENDPOINTS: nem toda conta usa todos os produtos,
+    // e um endpoint que a conta não tem responde HTTP 400 para sempre.
     const paths = ABACATE_PATHS;
     // Fatias PONDERADAS: o primeiro endpoint é o obrigatório e, na prática,
     // concentra toda a receita — a tabela por fonte mostrou os demais em
     // R$ 0,00 enquanto ele parava por falta de tempo no meio da paginação.
-    // Dar 50% a ele e 50% a endpoints vazios era desperdício; agora leva a
-    // maior parte. Se os demais seguirem sem receita, o certo é removê-los de
-    // vez por ABACATE_ENDPOINTS — aí ele fica com o orçamento inteiro.
     const MAIN_WEIGHT = 0.7;
     const weights = paths.map((_, i) =>
       i === 0 ? MAIN_WEIGHT : (1 - MAIN_WEIGHT) / Math.max(1, paths.length - 1)
@@ -375,7 +376,7 @@ async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel, budg
       const restWeight = weights.slice(i).reduce((a, b) => a + b, 0);
       const share = Math.floor((budget.left() * weights[i]) / restWeight);
       const slice = sliceBudget(budget, share);
-      const cacheKey = `${apiKey.slice(0, 12)}:${p}:${from}`;
+      const cacheKey = `${apiKey.slice(0, 12)}:${p}:${from}:${to}`;
       try {
         const onTruncate = (pth, n, reason) =>
           warnings.push(
@@ -383,7 +384,7 @@ async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel, budg
               `${reason || `atingiu o limite de ${MAX_PAGES} páginas`} — ` +
               `${n} transações contabilizadas, pode haver outras faltando.`
           );
-        const value = await listV2(p, "PAID", apiKey, from, slice, onTruncate);
+        const value = await listV2(p, "PAID", apiKey, from, to, slice, onTruncate);
         srcCache.set(cacheKey, { at: Date.now(), items: value });
         settled.push({ status: "fulfilled", value });
       } catch (reason) {
@@ -404,7 +405,7 @@ async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel, budg
       }
     }
 
-    // checkouts é obrigatório; se falhar, propaga (pode ser chave v1)
+    // o primeiro endpoint é obrigatório; se falhar, propaga (pode ser chave v1)
     if (settled[0].status === "rejected") throw settled[0].reason;
 
     // derivado de paths: "/payment-links/list" -> "payment-links"
@@ -449,8 +450,8 @@ function brtToUnix(dateStr, endOfDay) {
   return Math.floor(new Date(`${dateStr}T${t}-03:00`).getTime() / 1000);
 }
 
-// Diferente do Abacate, a Stripe filtra por data NO SERVIDOR (created[gte]/[lte]),
-// então não é preciso varrer o histórico inteiro — só as cobranças do período.
+// A Stripe filtra por data no servidor (created[gte]/[lte]), então não é
+// preciso varrer o histórico inteiro — só as cobranças do período.
 async function fetchStripeTransactions(apiKey, from, to, warnings, brandLabel, budget) {
   if (!apiKey) return [];
 
@@ -523,7 +524,7 @@ async function fetchStripeTransactions(apiKey, from, to, warnings, brandLabel, b
   return out;
 }
 
-// agrega uma marca: junta gasto (Google) + receita/transações (Abacate)
+// agrega uma marca: junta gasto (Google) + receita/transações (pagamentos)
 function buildBrand(name, gadsRows, abacateTx, from, to) {
   const daily = {}; // date -> { spend, revenue, transactions }
   let spend = 0,
@@ -597,7 +598,6 @@ export async function GET(request) {
   const force = searchParams.get("refresh") === "1";
 
   // cache em memória: mesma janela de datas dentro do TTL responde na hora
-  // (pulado quando o usuário pede refresh explícito)
   const cacheKey = `${from}:${to}`;
   const hit = memCache.get(cacheKey);
   if (!force && hit && Date.now() - hit.at < CACHE_TTL_MS && hit.payload.errors.length === 0) {
@@ -620,8 +620,7 @@ export async function GET(request) {
 
   // As fontes rodam em PARALELO. As duas marcas do Abacate usam chaves
   // (contas) diferentes, então têm buckets de rate limit separados — o que
-  // precisa ser serializado é a lista de endpoints DENTRO de cada marca, e isso
-  // continua sequencial em fetchAbacateTransactions.
+  // precisa ser serializado é a lista de endpoints DENTRO de cada marca.
   const settle = (p) =>
     p.then(
       (value) => ({ status: "fulfilled", value }),
@@ -633,6 +632,7 @@ export async function GET(request) {
       fetchAbacateTransactions(
         process.env.ABACATE_KEY_PROCESSO,
         from,
+        to,
         warnings,
         "Processo",
         budget
@@ -642,13 +642,13 @@ export async function GET(request) {
       fetchAbacateTransactions(
         process.env.ABACATE_KEY_PLACA,
         from,
+        to,
         warnings,
         "Placa",
         budget
       )
     ),
-    // Stripe é outro provedor: sem rate limit compartilhado com o Abacate,
-    // e filtra por data no servidor, então roda em paralelo sem custo.
+    // Stripe é outro provedor: sem rate limit compartilhado com o Abacate.
     settle(
       fetchStripeTransactions(
         process.env.STRIPE_KEY_PROCESSO,
@@ -721,6 +721,8 @@ export async function GET(request) {
   const totalSpend = brands.reduce((a, b) => a + b.spend, 0);
   const totalRevenue = brands.reduce((a, b) => a + b.revenue, 0);
   const totalTx = brands.reduce((a, b) => a + b.transactions, 0);
+  const totalGadsConv = brands.reduce((a, b) => a + (b.gadsConversions || 0), 0);
+  const totalGadsValue = brands.reduce((a, b) => a + (b.gadsConvValue || 0), 0);
 
   const total = {
     name: "Total",
@@ -730,6 +732,8 @@ export async function GET(request) {
     cpa: totalTx > 0 ? totalSpend / totalTx : null,
     roas: totalSpend > 0 ? totalRevenue / totalSpend : null,
     ticket: totalTx > 0 ? totalRevenue / totalTx : null,
+    gadsConversions: totalGadsConv,
+    gadsConvValue: totalGadsValue,
     series: Object.values(merged).sort((a, b) => (a.date < b.date ? -1 : 1)),
     sources: Object.values(mergedSources).sort((a, b) => b.revenue - a.revenue),
   };
@@ -758,8 +762,8 @@ export async function GET(request) {
     });
   }
 
-  // alguma fonte falhou (mesmo após retries): se temos um resultado completo
-  // anterior desta janela, devolve ele em vez de números incompletos
+  // alguma fonte falhou: se temos um resultado completo anterior desta janela,
+  // devolve ele em vez de números incompletos
   const good = lastGood.get(cacheKey);
   if (good) {
     const hora = new Date(good.updatedAt).toLocaleTimeString("pt-BR", {
