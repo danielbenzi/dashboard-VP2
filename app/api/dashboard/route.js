@@ -182,11 +182,17 @@ async function abFetch(url, apiKey, budget) {
     } catch (e) {
       // orçamento estourado: parar já, não queimar o que resta em retries
       if (e?.name === "BudgetError") break;
+      const isTimeout = e?.name === "TimeoutError";
       last = {
         res: { ok: false, status: 0 },
         json: null,
-        text: e?.name === "TimeoutError" ? "timeout na chamada" : String(e?.message || e),
+        text: isTimeout ? "timeout na chamada" : String(e?.message || e),
       };
+      // Timeout NÃO se resolve com retry: se o endpoint levou 12s, repetir a
+      // mesma chamada 600ms depois só queima o orçamento que faltaria para as
+      // próximas páginas. Retry serve para a falha intermitente
+      // ({"success":false}), que volta rápido — não para lentidão.
+      if (isTimeout) break;
     }
   }
   // nunca devolve null: o chamador desestrutura o resultado
@@ -351,12 +357,15 @@ async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel, budg
     // lista separada por vírgula. O primeiro da lista é tratado como o
     // obrigatório. Ex.: "/checkouts/list,/payment-links/list"
     const paths = ABACATE_PATHS;
-    // Fatias PONDERADAS, não iguais: o primeiro endpoint é obrigatório (se ele
-    // falha, a marca inteira falha) e concentra a maior parte da receita, então
-    // leva metade do tempo. Com fatias iguais ele ficava com uma única
-    // tentativa e estourava por timeout — os demais são complementares.
+    // Fatias PONDERADAS: o primeiro endpoint é o obrigatório e, na prática,
+    // concentra toda a receita — a tabela por fonte mostrou os demais em
+    // R$ 0,00 enquanto ele parava por falta de tempo no meio da paginação.
+    // Dar 50% a ele e 50% a endpoints vazios era desperdício; agora leva a
+    // maior parte. Se os demais seguirem sem receita, o certo é removê-los de
+    // vez por ABACATE_ENDPOINTS — aí ele fica com o orçamento inteiro.
+    const MAIN_WEIGHT = 0.7;
     const weights = paths.map((_, i) =>
-      i === 0 ? 0.5 : 0.5 / Math.max(1, paths.length - 1)
+      i === 0 ? MAIN_WEIGHT : (1 - MAIN_WEIGHT) / Math.max(1, paths.length - 1)
     );
     const settled = [];
     for (let i = 0; i < paths.length; i++) {
