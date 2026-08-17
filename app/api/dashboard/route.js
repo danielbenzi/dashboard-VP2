@@ -1,707 +1,882 @@
-"use client";
+import { NextResponse } from "next/server";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+export const maxDuration = 60;
 
-const BRL = new Intl.NumberFormat("pt-BR", {
-  style: "currency",
-  currency: "BRL",
-});
-const NUM = new Intl.NumberFormat("pt-BR");
+const WINDSOR_BASE = "https://connectors.windsor.ai/google_ads";
+const ABACATE_V2 = "https://api.abacatepay.com/v2";
+const ABACATE_V1 = "https://api.abacatepay.com/v1";
+const STRIPE_BASE = "https://api.stripe.com/v1";
 
-function fmtMoney(v) {
-  if (v == null || !Number.isFinite(v)) return "—";
-  return BRL.format(v);
-}
-function fmtNum(v) {
-  if (v == null || !Number.isFinite(v)) return "—";
-  return NUM.format(Math.round(v));
-}
-function fmtRoas(v) {
-  if (v == null || !Number.isFinite(v)) return "—";
-  return v.toFixed(2) + "x";
-}
-function fmtDate(d) {
-  return `${d.slice(8, 10)}/${d.slice(5, 7)}`;
-}
+// Timeout por chamada externa. O Abacate às vezes passa de 8s para responder;
+// como o orçamento global já protege a rota do 504, dá para ser mais paciente
+// aqui do que seria seguro sem ele.
+const FETCH_TIMEOUT_MS = 12000;
+// Orçamento GLOBAL da rota. Precisa ficar confortavelmente abaixo de maxDuration,
+// senão o Vercel mata a função no meio e o gateway devolve 504.
+const BUDGET_MS = Number(process.env.DASHBOARD_BUDGET_MS || 50000);
+// Tentativas por chamada ao Abacate (a API falha de forma intermitente)
+const MAX_ATTEMPTS = 3;
+// Teto de páginas por listagem (caminho de fallback).
+const MAX_PAGES = 120;
+// Registros por página no fallback paginado. A API aceita até 100, mas página
+// grande demora mais — com 100 até a PRIMEIRA página estourava o timeout.
+const ABACATE_PAGE_LIMIT = String(
+  Math.min(100, Math.max(1, Number(process.env.ABACATE_PAGE_LIMIT) || 50))
+);
+// startDate filtra por data de CRIAÇÃO, mas o dashboard conta pela data de
+// PAGAMENTO: um checkout criado dia 30 e pago dia 2 precisa entrar.
+const ABACATE_LOOKBACK_DAYS = Number(process.env.ABACATE_LOOKBACK_DAYS || 7);
+// Endpoints de receita do Abacate (fallback), na ordem de prioridade.
+const ABACATE_PATHS = (
+  process.env.ABACATE_ENDPOINTS ||
+  "/checkouts/list,/transparents/list,/payment-links/list,/subscriptions/list"
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+// Cache em memória (por instância warm da função)
+const CACHE_TTL_MS = 2 * 60 * 1000;
+const memCache = new Map(); // key -> { at, payload }
+// último resultado COMPLETO por janela de datas, usado como fallback
+const lastGood = new Map(); // key -> payload
+// última listagem boa POR FONTE
+const srcCache = new Map(); // key -> { at, items }
 
-// datas sempre em America/Sao_Paulo (mesmo fuso usado pela API)
 const TZ = "America/Sao_Paulo";
-function today() {
+
+// ---------- datas (sempre em America/Sao_Paulo, igual ao frontend) ----------
+function todayISO() {
   return new Date().toLocaleDateString("en-CA", { timeZone: TZ });
 }
-function firstOfMonth() {
-  const [y, m] = today().split("-");
+function firstOfMonthISO() {
+  const [y, m] = todayISO().split("-");
   return `${y}-${m}-01`;
 }
-function daysAgo(n) {
-  const d = new Date();
-  d.setDate(d.getDate() - n);
+
+function num(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+// desloca uma data YYYY-MM-DD em N dias (meio-dia evita borda de fuso)
+function shiftDays(dateStr, days) {
+  const d = new Date(`${dateStr}T12:00:00-03:00`);
+  d.setDate(d.getDate() + days);
   return d.toLocaleDateString("en-CA", { timeZone: TZ });
 }
 
-export default function Page() {
-  const [from, setFrom] = useState(firstOfMonth());
-  const [to, setTo] = useState(today());
-  const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState(null);
-  const abortRef = useRef(null);
+function inRange(dateStr, from, to) {
+  if (!dateStr) return false;
+  return dateStr >= from && dateStr <= to;
+}
 
-  // force=true (botão Atualizar): manda ?refresh=1, que faz a API ignorar
-  // todos os caches e buscar os dados na hora
-  async function load(f = from, t = to, force = false) {
-    // cancela request anterior ainda em andamento
-    if (abortRef.current) abortRef.current.abort();
-    const ctrl = new AbortController();
-    abortRef.current = ctrl;
+// relógio global da requisição
+function makeBudget(ms) {
+  const end = Date.now() + ms;
+  return {
+    left: () => end - Date.now(),
+    expired: () => Date.now() >= end,
+  };
+}
 
-    // rede de segurança: a API tem orçamento próprio (~50s) e sempre responde
-    // antes disso; se mesmo assim nada voltar, aborta com mensagem clara em vez
-    // de deixar a tela em "Carregando…" para sempre
-    let timedOut = false;
-    const killer = setTimeout(() => {
-      timedOut = true;
-      ctrl.abort();
-    }, 60000);
+// sub-orçamento: limita quanto UMA etapa pode consumir, para um endpoint lento
+// não deixar os seguintes sem tempo.
+function sliceBudget(parent, ms) {
+  const end = Date.now() + ms;
+  return {
+    left: () => Math.min(parent.left(), end - Date.now()),
+    expired: () => parent.expired() || Date.now() >= end,
+  };
+}
 
-    setLoading(true);
-    setErr(null);
+function budgetError() {
+  const e = new Error("tempo da requisição esgotado antes de terminar a busca");
+  e.name = "BudgetError";
+  return e;
+}
+
+// fetch com timeout, limitado ao que ainda resta do orçamento global
+function tFetch(url, opts = {}, budget) {
+  const left = budget ? budget.left() : FETCH_TIMEOUT_MS;
+  const ms = Math.min(FETCH_TIMEOUT_MS, left);
+  if (ms <= 0) throw budgetError();
+  return fetch(url, {
+    ...opts,
+    cache: "no-store",
+    signal: AbortSignal.timeout(ms),
+  });
+}
+
+// ---------- Google Ads (via Windsor.ai) ----------
+async function fetchGoogleAds(from, to, budget) {
+  const key = process.env.WINDSOR_API_KEY;
+  if (!key) throw new Error("WINDSOR_API_KEY não configurada");
+
+  const fields = [
+    "account_name",
+    "date",
+    "spend",
+    "clicks",
+    "impressions",
+    "conversions",
+    "conversion_value",
+  ].join(",");
+
+  const url =
+    `${WINDSOR_BASE}?api_key=${encodeURIComponent(key)}` +
+    `&date_from=${from}&date_to=${to}` +
+    `&fields=${fields}`;
+
+  const res = await tFetch(url, {}, budget);
+  if (!res.ok) {
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(
+        "chave WINDSOR_API_KEY inválida ou sem acesso à API de dados do Windsor."
+      );
+    }
+    const t = await res.text();
+    throw new Error(`Windsor ${res.status}: ${t.slice(0, 160)}`);
+  }
+  const json = await res.json();
+  const rows = Array.isArray(json) ? json : json.data || [];
+  return rows;
+}
+
+// Detalhe HORÁRIO do dia corrente. Só faz sentido para o gasto: o Google Ads
+// entrega spend/clicks/conversions por hora, enquanto o resumo do Abacate
+// agrega por dia.
+async function fetchGoogleAdsHourly(day, budget) {
+  const key = process.env.WINDSOR_API_KEY;
+  if (!key) return [];
+
+  const fields = ["account_name", "date", "hour", "spend", "clicks", "conversions"].join(",");
+  const url =
+    `${WINDSOR_BASE}?api_key=${encodeURIComponent(key)}` +
+    `&date_from=${day}&date_to=${day}` +
+    `&fields=${fields}`;
+
+  const res = await tFetch(url, {}, budget);
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`Windsor (hora a hora) ${res.status}: ${t.slice(0, 160)}`);
+  }
+  const json = await res.json();
+  const rows = Array.isArray(json) ? json : json.data || [];
+
+  // agrega por marca + hora (o conector pode devolver mais de uma linha por hora)
+  const byKey = new Map();
+  for (const r of rows) {
+    const name = String(r.account_name || "").trim();
+    const hour = Number(r.hour);
+    if (!name || !Number.isFinite(hour)) continue;
+    const k = `${name}|${hour}`;
+    const cur = byKey.get(k) || { name, hour, spend: 0, clicks: 0, conversions: 0 };
+    cur.spend += num(r.spend);
+    cur.clicks += num(r.clicks);
+    cur.conversions += num(r.conversions);
+    byKey.set(k, cur);
+  }
+  return [...byKey.values()].sort((a, b) => a.hour - b.hour);
+}
+
+// ---------- AbacatePay ----------
+async function abFetch(url, apiKey, budget) {
+  let last = null;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    if (budget.expired()) break;
+    if (attempt > 0) {
+      const wait = Math.min(600 * 2 ** (attempt - 1), budget.left() - 1000);
+      if (wait <= 0) break;
+      await new Promise((r) => setTimeout(r, wait));
+    }
     try {
-      const res = await fetch(
-        `/api/dashboard?from=${f}&to=${t}${force ? "&refresh=1" : ""}`,
+      const res = await tFetch(
+        url,
         {
-          signal: ctrl.signal,
-          cache: "no-store",
-        }
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+          },
+        },
+        budget
       );
       const text = await res.text();
       let json = null;
       try {
         json = JSON.parse(text);
       } catch {
-        /* resposta não-JSON (ex.: página de erro 504 da Vercel) */
+        /* resposta não-JSON */
       }
-      if (!res.ok) {
-        throw new Error(
-          json?.error ||
-            (res.status === 504
-              ? "O servidor demorou demais para responder. Tente novamente."
-              : `Falha ao carregar (HTTP ${res.status})`)
-        );
-      }
-      if (!json) throw new Error("Resposta inválida do servidor.");
-      setData(json);
+      const failed = !res.ok || (json && json.success === false);
+      if (!failed) return { res, json, text };
+      last = { res, json, text };
+      // erro de autenticação não se resolve com retry
+      if (res.status === 401 || res.status === 403) break;
     } catch (e) {
-      if (e.name === "AbortError") {
-        // abortado pela rede de segurança (≠ cancelado por um request novo)
-        if (!timedOut) return;
-        setErr("O servidor demorou demais para responder. Tente novamente.");
-      } else {
-        setErr(e.message);
-      }
-    } finally {
-      clearTimeout(killer);
-      if (abortRef.current === ctrl) setLoading(false);
+      if (e?.name === "BudgetError") break;
+      const isTimeout = e?.name === "TimeoutError";
+      last = {
+        res: { ok: false, status: 0 },
+        json: null,
+        text: isTimeout ? "timeout na chamada" : String(e?.message || e),
+      };
+      // Timeout NÃO se resolve com retry.
+      if (isTimeout) break;
     }
   }
+  return (
+    last || {
+      res: { ok: false, status: 0 },
+      json: null,
+      text: "tempo da requisição esgotado",
+    }
+  );
+}
 
-  useEffect(() => {
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+// converte timestamp (UTC) para a data em America/Sao_Paulo
+function txDate(it) {
+  const raw = it.paidAt || it.updatedAt || it.createdAt || it.created_at || "";
+  if (!raw) return "";
+  const d = new Date(raw);
+  if (isNaN(d)) return String(raw).slice(0, 10);
+  return d.toLocaleDateString("en-CA", { timeZone: TZ });
+}
 
-  function applyPreset(p) {
-    const t = today();
-    let f = firstOfMonth();
-    if (p === "7d") f = daysAgo(6);
-    else if (p === "30d") f = daysAgo(29);
-    setFrom(f);
-    setTo(t);
-    load(f, t);
+// { amount: reais, date: 'YYYY-MM-DD' } — a API devolve centavos
+function normalizeTx(it) {
+  const cents = it.paidAmount != null ? it.paidAmount : it.amount;
+  return { amount: num(cents) / 100, date: txDate(it) };
+}
+
+// lista paginada de um recurso v2, com filtro de data no servidor (fallback).
+async function listV2(path, paidStatus, apiKey, from, to, budget, onTruncate, useStatusParam = true) {
+  const out = [];
+  let after = null;
+  let truncated = true;
+  let truncReason = null;
+  let page = 0;
+
+  // Falha no MEIO da paginação não pode descartar o que já foi lido.
+  const bail = (err) => {
+    if (out.length > 0) {
+      if (onTruncate) {
+        onTruncate(
+          path,
+          out.length,
+          `parou na página ${page + 1} (${err.message}) — resultado PARCIAL`
+        );
+      }
+      return out;
+    }
+    throw err;
+  };
+
+  for (; page < MAX_PAGES; page++) {
+    if (budget.expired()) return bail(budgetError());
+
+    const u = new URL(`${ABACATE_V2}${path}`);
+    u.searchParams.set("limit", ABACATE_PAGE_LIMIT);
+    if (useStatusParam) u.searchParams.set("status", paidStatus);
+    // Filtro de data NO SERVIDOR — sem ele a API varre o histórico inteiro.
+    if (from) u.searchParams.set("startDate", shiftDays(from, -ABACATE_LOOKBACK_DAYS));
+    if (to) u.searchParams.set("endDate", to);
+    if (after) u.searchParams.set("after", after);
+
+    const { res, json, text } = await abFetch(u.toString(), apiKey, budget);
+    if (!res.ok || (json && json.success === false)) {
+      // 400 nos checkouts, 422 em /subscriptions — em ambos o plano B é listar
+      // sem o filtro de status.
+      if ((res.status === 400 || res.status === 422) && useStatusParam) {
+        return listV2(path, paidStatus, apiKey, from, to, budget, onTruncate, false);
+      }
+      const tried = useStatusParam ? "" : " (também sem o filtro de status)";
+      const err = new Error(
+        `HTTP ${res.status} (página ${page + 1})${tried}: ${text.slice(0, 200)}`
+      );
+      err.status = res.status;
+      err.body = text;
+      return bail(err);
+    }
+    const raw = (json && json.data) || [];
+    const items = useStatusParam
+      ? raw
+      : raw.filter((it) => String(it.status).toUpperCase() === paidStatus);
+    for (const it of items) out.push(it);
+
+    // pagination.hasMore diz se há mais; pagination.next é o cursor (publicId).
+    const pg = (json && json.pagination) || {};
+    const fullPage = raw.length >= Number(ABACATE_PAGE_LIMIT);
+    if (pg.hasMore === false || (pg.hasMore == null && !fullPage)) {
+      truncated = false;
+      break;
+    }
+
+    const next = pg.next || null;
+    if (!next || next === after) {
+      // Página CHEIA sem cursor é suspeito: provavelmente há dados fora de alcance.
+      truncated = fullPage;
+      if (fullPage) {
+        truncReason =
+          "a API devolveu uma página cheia sem cursor de próxima página (pagination.next)";
+      }
+      break;
+    }
+    after = next;
+  }
+  if (truncated && onTruncate) onTruncate(path, out.length, truncReason);
+  return out;
+}
+
+// v1: /billing/list devolve TODAS as cobranças numa resposta só — a
+// especificação v1 não aceita nenhum parâmetro de consulta. Filtramos PAID aqui.
+async function listV1Billings(apiKey, budget) {
+  const { res, json, text } = await abFetch(`${ABACATE_V1}/billing/list`, apiKey, budget);
+  if (!res.ok || (json && json.success === false)) {
+    const err = new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
+    err.status = res.status;
+    err.body = text;
+    throw err;
+  }
+  const items = (json && json.data) || [];
+  return items.filter((b) => String(b.status).toUpperCase() === "PAID");
+}
+
+// /public-mrr/revenue devolve receita total, total de transações e o detalhe
+// por dia do período em UMA chamada, já agregado no servidor (cache de 1h).
+async function fetchAbacateRevenueSummary(apiKey, from, to, budget, onMismatch) {
+  const u = new URL(`${ABACATE_V2}/public-mrr/revenue`);
+  u.searchParams.set("startDate", from);
+  u.searchParams.set("endDate", to);
+
+  const { res, json, text } = await abFetch(u.toString(), apiKey, budget);
+  if (!res.ok || (json && json.success === false)) {
+    const err = new Error(`HTTP ${res.status}: ${String(text).slice(0, 200)}`);
+    err.status = res.status;
+    err.body = text;
+    throw err;
   }
 
-  return (
-    <div className="wrap">
-      <div className="topbar">
-        <div className="title">
-          <h1>Verifica Processo &amp; Verifica Placa</h1>
-          <p>
-            Gasto, transações, CPA, ROAS e receita paga · Google Ads + AbacatePay
-            {data?.updatedAt && (
-              <>
-                {" "}
-                · atualizado{" "}
-                {new Date(data.updatedAt).toLocaleString("pt-BR", {
-                  timeZone: TZ,
-                })}
-              </>
-            )}
-          </p>
-        </div>
-        <div className="controls">
-          <select onChange={(e) => applyPreset(e.target.value)} defaultValue="mes">
-            <option value="mes">Mês atual</option>
-            <option value="7d">Últimos 7 dias</option>
-            <option value="30d">Últimos 30 dias</option>
-          </select>
-          <input
-            type="date"
-            value={from}
-            onChange={(e) => setFrom(e.target.value)}
-          />
-          <input type="date" value={to} onChange={(e) => setTo(e.target.value)} />
-          <button
-            className="btn"
-            onClick={() => load(from, to, true)}
-            disabled={loading}
-          >
-            {loading ? "Carregando…" : "Atualizar"}
-          </button>
-        </div>
-      </div>
+  const d = (json && json.data) || {};
+  const perDay = d.transactionsPerDay || {};
+  // um "balde" por dia: mesma forma das transações individuais, mas com
+  // `count` para o total não sair como 1 por dia
+  const out = [];
+  for (const [date, v] of Object.entries(perDay)) {
+    const amount = num(v && v.amount) / 100;
+    const count = num(v && v.count);
+    if (count <= 0 && amount <= 0) continue;
+    out.push({ amount, count, date, source: "Abacate" });
+  }
 
-      {err && (
-        <div className="banner">
-          Erro: {err}{" "}
-          <button className="btn" onClick={() => load(from, to, true)}>
-            Tentar de novo
-          </button>
-        </div>
-      )}
-      {data?.errors?.length > 0 && (
-        <div className="banner">
-          Algumas fontes não responderam (números podem estar incompletos):
-          <ul>
-            {data.errors.map((e, i) => (
-              <li key={i}>{e}</li>
-            ))}
-          </ul>
-        </div>
-      )}
+  // CONFERÊNCIA: usamos o detalhe por dia (para ter a série do gráfico), então
+  // ele PRECISA bater com o total do período — senão a receita sairia menor
+  // em silêncio.
+  const somaDias = out.reduce((a, x) => a + x.amount, 0);
+  const totalApi = num(d.totalRevenue) / 100;
+  const txDias = out.reduce((a, x) => a + x.count, 0);
+  const txApi = num(d.totalTransactions);
+  const tolerancia = Math.max(0.01 * Math.max(out.length, 1), totalApi * 0.001);
+  if (onMismatch && totalApi > 0 && Math.abs(somaDias - totalApi) > tolerancia) {
+    onMismatch(
+      `o detalhe por dia soma R$ ${somaDias.toFixed(2)}, mas a API informa ` +
+        `R$ ${totalApi.toFixed(2)} no período (${txDias} vs ${txApi} transações) ` +
+        `— usando o detalhe, pode haver receita fora da série diária.`
+    );
+  }
+  return out;
+}
 
-      {loading && !data && <div className="loading">Carregando dados…</div>}
+// Listagem detalhada v2 — último recurso.
+async function fetchAbacateByListing(apiKey, from, to, warnings, brandLabel, budget) {
+  if (!apiKey) return [];
 
-      {data && (
-        <>
-          <Section brand={data.total} color="#c9d4e8" title="Total" />
-          <HourlyCard hourly={data.hourly} />
-          <Section
-            brand={data.brands[0]}
-            color="var(--processo)"
-            title={data.brands[0].name}
-          />
-          <Section
-            brand={data.brands[1]}
-            color="var(--placa)"
-            title={data.brands[1].name}
-          />
-        </>
-      )}
-    </div>
+  try {
+    // Obs.: /pix/list NÃO entra aqui — lista transferências PIX ENVIADAS.
+    const paths = ABACATE_PATHS;
+    // Fatias PONDERADAS: o primeiro endpoint é o obrigatório e concentra a receita.
+    const MAIN_WEIGHT = 0.7;
+    const weights = paths.map((_, i) =>
+      i === 0 ? MAIN_WEIGHT : (1 - MAIN_WEIGHT) / Math.max(1, paths.length - 1)
+    );
+    const settled = [];
+    for (let i = 0; i < paths.length; i++) {
+      const p = paths[i];
+      const restWeight = weights.slice(i).reduce((a, b) => a + b, 0);
+      const share = Math.floor((budget.left() * weights[i]) / restWeight);
+      const slice = sliceBudget(budget, share);
+      const cacheKey = `${apiKey.slice(0, 12)}:${p}:${from}:${to}`;
+      try {
+        const onTruncate = (pth, n, reason) =>
+          warnings.push(
+            `Abacate (${brandLabel}${pth}): ` +
+              `${reason || `atingiu o limite de ${MAX_PAGES} páginas`} — ` +
+              `${n} transações contabilizadas, pode haver outras faltando.`
+          );
+        const value = await listV2(p, "PAID", apiKey, from, to, slice, onTruncate);
+        srcCache.set(cacheKey, { at: Date.now(), items: value });
+        settled.push({ status: "fulfilled", value });
+      } catch (reason) {
+        const saved = srcCache.get(cacheKey);
+        if (saved) {
+          const hora = new Date(saved.at).toLocaleTimeString("pt-BR", {
+            timeZone: TZ,
+            hour: "2-digit",
+            minute: "2-digit",
+          });
+          warnings.push(
+            `Abacate (${brandLabel}${p}): falhou agora — usando dados salvos das ${hora}`
+          );
+          settled.push({ status: "fulfilled", value: saved.items });
+        } else {
+          settled.push({ status: "rejected", reason });
+        }
+      }
+    }
+
+    if (settled[0].status === "rejected") throw settled[0].reason;
+
+    const labels = paths.map((p) => p.split("/").filter(Boolean)[0] || p);
+    const tagged = [];
+    settled.forEach((r, i) => {
+      if (r.status === "fulfilled") {
+        for (const it of r.value) tagged.push({ it, source: `Abacate/${labels[i]}` });
+      } else
+        warnings.push(
+          `Abacate (${brandLabel}/${labels[i]}): ${r.reason?.message || r.reason}`
+        );
+    });
+
+    const seen = new Set();
+    const all = [];
+    for (const { it, source } of tagged) {
+      const id = it.id || JSON.stringify(it);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      all.push({ ...normalizeTx(it), source });
+    }
+    return all;
+  } catch (e) {
+    const isVersionMismatch =
+      /version mismatch/i.test(e.body || e.message || "") || e.status === 401;
+    if (!isVersionMismatch) throw e;
+    const billings = await listV1Billings(apiKey, budget);
+    return billings.map(normalizeTx);
+  }
+}
+
+// DUAS fontes independentes para o mesmo número, buscadas em paralelo:
+//   /v1/billing/list        cobranças uma a uma, sem paginação. Filtramos PAID
+//                           e a janela aqui, então a semântica é auditável.
+//   /v2/public-mrr/revenue  total já agregado pelo Abacate para o período.
+// Usamos o v1 e conferimos contra o resumo.
+async function fetchAbacateTransactions(apiKey, from, to, warnings, brandLabel, budget) {
+  if (!apiKey) return [];
+
+  const settle = (p) => p.then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
+  const [v1r, sumr] = await Promise.all([
+    settle(listV1Billings(apiKey, budget)),
+    settle(
+      fetchAbacateRevenueSummary(apiKey, from, to, budget, (msg) =>
+        warnings.push(`Abacate (${brandLabel}/resumo): ${msg}`)
+      )
+    ),
+  ]);
+
+  const somaNaJanela = (txs) =>
+    txs.filter((t) => inRange(t.date, from, to)).reduce((a, t) => a + t.amount, 0);
+  const totalResumo = sumr.ok ? somaNaJanela(sumr.v) : null;
+
+  // v1 só é a fonte se trouxe algo NA JANELA. Uma conta que use apenas a API
+  // v2 pode responder 200 com lista vazia, e adotar esse vazio mostraria
+  // R$ 0,00 enquanto o resumo tem a receita real.
+  const txV1 = v1r.ok ? v1r.v.map((b) => ({ ...normalizeTx(b), source: "Abacate" })) : [];
+  const v1TemDados = somaNaJanela(txV1) > 0;
+
+  if (v1r.ok && v1TemDados) {
+    const tx = txV1;
+    const totalV1 = somaNaJanela(tx);
+    if (totalResumo != null) {
+      const dif = Math.abs(totalV1 - totalResumo);
+      // 0,5% de folga cobre diferença de fuso na borda do período
+      if (dif > Math.max(1, totalResumo * 0.005)) {
+        warnings.push(
+          `Abacate (${brandLabel}): as duas fontes discordam — ` +
+            `/v1/billing/list soma R$ ${totalV1.toFixed(2)} e o resumo do período ` +
+            `informa R$ ${totalResumo.toFixed(2)}. Mostrando o /v1 (detalhado).`
+        );
+      }
+    } else {
+      warnings.push(
+        `Abacate (${brandLabel}/resumo): não respondeu (${sumr.e?.message || sumr.e}) — ` +
+          `sem segunda fonte para conferir o total.`
+      );
+    }
+    return tx;
+  }
+
+  // v1 falhou ou veio vazio: fica o resumo, se ele trouxe algo
+  if (sumr.ok && sumr.v.length > 0) {
+    const motivo = v1r.ok
+      ? "não retornou cobranças no período"
+      : `${v1r.e?.message || v1r.e}`;
+    warnings.push(
+      `Abacate (${brandLabel}/v1): ${motivo} — usando o resumo agregado do período.`
+    );
+    return sumr.v;
+  }
+
+  // as duas falharam: último recurso é a listagem paginada v2
+  const motivoV1 = v1r.ok ? "sem cobranças no período" : `${v1r.e?.message || v1r.e}`;
+  warnings.push(
+    `Abacate (${brandLabel}): /v1 (${motivoV1}) e resumo ` +
+      `(${sumr.ok ? "vazio" : sumr.e?.message || sumr.e}) não trouxeram dados — ` +
+      `tentando a listagem paginada.`
   );
+  return fetchAbacateByListing(apiKey, from, to, warnings, brandLabel, budget);
 }
 
-// Gasto hora a hora do Google Ads no último dia da janela. Só mídia: o
-// resumo do Abacate agrega por dia, então receita horária não existe — mostrar
-// uma linha de receita aqui daria a impressão de precisão que o dado não tem.
-function HourlyCard({ hourly }) {
-  const rows = hourly?.rows || [];
-  if (rows.length === 0) return null;
-
-  const marcas = [...new Set(rows.map((r) => r.name))];
-  const horas = [...new Set(rows.map((r) => r.hour))].sort((a, b) => a - b);
-  const cell = (name, hour) =>
-    rows.find((r) => r.name === name && r.hour === hour) || null;
-
-  const totalDia = rows.reduce((a, r) => a + r.spend, 0);
-  const ultima = horas[horas.length - 1];
-
-  return (
-    <div className="table-card">
-      <div className="legend">
-        <strong style={{ color: "var(--text)" }}>
-          Gasto hora a hora — {fmtDate(hourly.day)} (Google Ads)
-        </strong>
-        <span style={{ marginLeft: "auto" }}>
-          {fmtMoney(totalDia)} até as {String(ultima).padStart(2, "0")}h
-        </span>
-      </div>
-      <div className="table-scroll">
-        <table className="day-table">
-          <thead>
-            <tr>
-              <th>Hora</th>
-              {marcas.map((m) => (
-                <th key={m}>{m} — gasto</th>
-              ))}
-              <th>Cliques</th>
-              <th>Conversões (Google)</th>
-            </tr>
-          </thead>
-          <tbody>
-            {horas
-              .slice()
-              .reverse()
-              .map((h) => {
-                const doHora = rows.filter((r) => r.hour === h);
-                return (
-                  <tr key={h}>
-                    <td>{String(h).padStart(2, "0")}h</td>
-                    {marcas.map((m) => {
-                      const c = cell(m, h);
-                      return <td key={m}>{c ? fmtMoney(c.spend) : "—"}</td>;
-                    })}
-                    <td>{fmtNum(doHora.reduce((a, r) => a + r.clicks, 0))}</td>
-                    <td>{fmtNum(doHora.reduce((a, r) => a + r.conversions, 0))}</td>
-                  </tr>
-                );
-              })}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
+// ---------- Stripe (pagamentos com cartão) ----------
+// O Brasil não usa horário de verão desde 2019: offset fixo -03:00.
+function brtToUnix(dateStr, endOfDay) {
+  const t = endOfDay ? "23:59:59" : "00:00:00";
+  return Math.floor(new Date(`${dateStr}T${t}-03:00`).getTime() / 1000);
 }
 
-function Section({ brand, color, title }) {
-  return (
-    <>
-      <BrandBlock brand={brand} color={color} />
-      <SourceBreakdown sources={brand.sources} total={brand.revenue} />
-      <ChartCard series={brand.series} title={`${title} — dia a dia`} />
-      <DayTable series={brand.series} title={`${title} — tabela dia a dia`} />
-    </>
-  );
+async function fetchStripeTransactions(apiKey, from, to, warnings, brandLabel, budget) {
+  if (!apiKey) return [];
+
+  const out = [];
+  let startingAfter = null;
+  let truncated = true;
+
+  for (let page = 0; page < MAX_PAGES; page++) {
+    if (budget.expired()) throw budgetError();
+
+    const u = new URL(`${STRIPE_BASE}/charges`);
+    u.searchParams.set("limit", "100");
+    u.searchParams.set("created[gte]", String(brtToUnix(from, false)));
+    u.searchParams.set("created[lte]", String(brtToUnix(to, true)));
+    if (startingAfter) u.searchParams.set("starting_after", startingAfter);
+
+    const res = await tFetch(
+      u.toString(),
+      { headers: { Authorization: `Bearer ${apiKey}` } },
+      budget
+    );
+    const text = await res.text();
+    let json = null;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      /* resposta não-JSON */
+    }
+    if (!res.ok) {
+      const msg = json?.error?.message || text.slice(0, 200);
+      const err = new Error(`HTTP ${res.status} (página ${page + 1}): ${msg}`);
+      err.status = res.status;
+      throw err;
+    }
+
+    const raw = (json && json.data) || [];
+    for (const ch of raw) {
+      // só cobrança efetivamente capturada; estorno abate do valor
+      if (ch.status !== "succeeded" || !ch.paid) continue;
+      const gross = num(ch.amount_captured != null ? ch.amount_captured : ch.amount);
+      const net = gross - num(ch.amount_refunded);
+      if (net <= 0) continue; // totalmente estornada
+      out.push({
+        amount: net / 100,
+        date: new Date(num(ch.created) * 1000).toLocaleDateString("en-CA", {
+          timeZone: TZ,
+        }),
+        source: "Stripe",
+      });
+    }
+
+    if (!json?.has_more || raw.length === 0) {
+      truncated = false;
+      break;
+    }
+    const next = raw[raw.length - 1].id;
+    if (!next || next === startingAfter) {
+      truncated = false;
+      break;
+    }
+    startingAfter = next;
+  }
+
+  if (truncated) {
+    warnings.push(
+      `Stripe (${brandLabel}): atingiu o limite de ${MAX_PAGES} páginas ` +
+        `(${out.length} cobranças lidas) — pode haver pagamentos não contabilizados.`
+    );
+  }
+  return out;
 }
 
-// De onde veio cada real. Uma fonte com R$ 0,00 (ou ausente da lista) é o
-// sinal de que ela está desligada, falhando ou sem chave configurada —
-// sem isso, receita faltando parece simplesmente venda fraca.
-function SourceBreakdown({ sources, total }) {
-  if (!sources || sources.length === 0) return null;
-  return (
-    <div className="table-card">
-      <div className="legend">
-        <strong style={{ color: "var(--text)" }}>Receita por fonte</strong>
-      </div>
-      <div className="table-scroll">
-        <table className="day-table">
-          <thead>
-            <tr>
-              <th>Fonte</th>
-              <th>Receita</th>
-              <th>% do total</th>
-              <th>Transações</th>
-              <th>Ticket</th>
-            </tr>
-          </thead>
-          <tbody>
-            {sources.map((s) => (
-              <tr key={s.source}>
-                <td>{s.source}</td>
-                <td>{fmtMoney(s.revenue)}</td>
-                <td>{total > 0 ? ((s.revenue / total) * 100).toFixed(1) + "%" : "—"}</td>
-                <td>{fmtNum(s.transactions)}</td>
-                <td>
-                  {fmtMoney(s.transactions > 0 ? s.revenue / s.transactions : null)}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
+// agrega uma marca: junta gasto (Google) + receita/transações (pagamentos)
+function buildBrand(name, gadsRows, abacateTx, from, to) {
+  const daily = {};
+  let spend = 0,
+    clicks = 0,
+    impressions = 0,
+    gadsConversions = 0,
+    gadsConvValue = 0;
+
+  for (const r of gadsRows) {
+    if (String(r.account_name).trim() !== name) continue;
+    const d = String(r.date).slice(0, 10);
+    if (!inRange(d, from, to)) continue;
+    const s = num(r.spend);
+    spend += s;
+    clicks += num(r.clicks);
+    impressions += num(r.impressions);
+    gadsConversions += num(r.conversions);
+    gadsConvValue += num(r.conversion_value);
+    if (!daily[d]) daily[d] = { date: d, spend: 0, revenue: 0, transactions: 0 };
+    daily[d].spend += s;
+  }
+
+  let revenue = 0,
+    transactions = 0;
+  // quanto cada fonte trouxe: revela se um número baixo é venda fraca ou
+  // fonte faltando/desligada
+  const bySource = {};
+  for (const t of abacateTx) {
+    if (!inRange(t.date, from, to)) continue;
+    // `count` existe quando a linha é um agregado diário (resumo do Abacate);
+    // uma cobrança individual vale 1.
+    const n = num(t.count) || 1;
+    revenue += t.amount;
+    transactions += n;
+    const s = t.source || "desconhecido";
+    if (!bySource[s]) bySource[s] = { source: s, revenue: 0, transactions: 0 };
+    bySource[s].revenue += t.amount;
+    bySource[s].transactions += n;
+    if (!daily[t.date])
+      daily[t.date] = { date: t.date, spend: 0, revenue: 0, transactions: 0 };
+    daily[t.date].revenue += t.amount;
+    daily[t.date].transactions += n;
+  }
+  const sources = Object.values(bySource).sort((a, b) => b.revenue - a.revenue);
+
+  const series = Object.values(daily).sort((a, b) => (a.date < b.date ? -1 : 1));
+
+  const cpa = transactions > 0 ? spend / transactions : null;
+  const roas = spend > 0 ? revenue / spend : null;
+  const ticket = transactions > 0 ? revenue / transactions : null;
+
+  return {
+    name,
+    spend,
+    revenue,
+    transactions,
+    cpa,
+    roas,
+    ticket,
+    clicks,
+    impressions,
+    gadsConversions,
+    gadsConvValue,
+    series,
+    sources,
+  };
 }
 
-function BrandBlock({ brand, color }) {
-  const takeRate = brand.revenue - brand.spend;
-  const margin =
-    brand.revenue > 0 ? ((takeRate / brand.revenue) * 100).toFixed(0) : null;
-  return (
-    <>
-      <div className="section-title">
-        <span className="dot" style={{ background: color }} />
-        {brand.name}
-      </div>
-      <div className="cards">
-        <Card label="Gasto" value={fmtMoney(brand.spend)} />
-        <Card label="Receita paga" value={fmtMoney(brand.revenue)} />
-        <Card
-          label="Take rate"
-          value={fmtMoney(takeRate)}
-          valueColor={takeRate >= 0 ? "var(--green)" : "var(--red)"}
-          sub={margin != null ? `${margin}% da receita` : null}
-        />
-        <Card
-          label="Transações"
-          value={fmtNum(brand.transactions)}
-          sub={brand.ticket != null ? `Ticket ${fmtMoney(brand.ticket)}` : null}
-        />
-        <Card label="CPA" value={fmtMoney(brand.cpa)} />
-        <Card label="ROAS" value={fmtRoas(brand.roas)} />
-      </div>
-      <Coverage brand={brand} />
-    </>
-  );
-}
+export async function GET(request) {
+  const { searchParams } = new URL(request.url);
+  const from = searchParams.get("from") || firstOfMonthISO();
+  const to = searchParams.get("to") || todayISO();
+  const force = searchParams.get("refresh") === "1";
 
-// Comparação com o que o próprio Google Ads registrou. As APIs de pagamento
-// são lentas demais para ler todas as transações do mês dentro do limite da
-// função, então "Receita paga" pode ser uma fração do real. Sem este bloco,
-// essa fração parece o número verdadeiro — e o ROAS parece catastrófico.
-function Coverage({ brand }) {
-  const conv = brand.gadsConversions;
-  const value = brand.gadsConvValue;
-  if (!conv || conv <= 0) return null;
-
-  const cobertura = (brand.transactions / conv) * 100;
-  const roasGoogle = brand.spend > 0 ? value / brand.spend : null;
-  const parcial = cobertura < 90;
-
-  return (
-    <div className="table-card">
-      <div className="legend">
-        <strong style={{ color: "var(--text)" }}>
-          Conferência com o Google Ads
-        </strong>
-      </div>
-      <div className="table-scroll">
-        <table className="day-table">
-          <thead>
-            <tr>
-              <th>Origem do número</th>
-              <th>Transações</th>
-              <th>Receita</th>
-              <th>ROAS</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>Google Ads (conversões)</td>
-              <td>{fmtNum(conv)}</td>
-              <td>{fmtMoney(value)}</td>
-              <td>{fmtRoas(roasGoogle)}</td>
-            </tr>
-            <tr>
-              <td>Pagamentos lidos (Abacate + Stripe)</td>
-              <td>{fmtNum(brand.transactions)}</td>
-              <td>{fmtMoney(brand.revenue)}</td>
-              <td>{fmtRoas(brand.roas)}</td>
-            </tr>
-          </tbody>
-          <tfoot>
-            <tr>
-              <td>Cobertura</td>
-              <td className={parcial ? "neg" : "pos"}>
-                {cobertura.toFixed(1)}%
-              </td>
-              <td colSpan={2} className={parcial ? "neg" : "pos"}>
-                {parcial
-                  ? "As APIs de pagamento não entregaram tudo — use o ROAS do Google como referência."
-                  : "Leitura completa."}
-              </td>
-            </tr>
-          </tfoot>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-function Card({ label, value, sub, valueColor }) {
-  return (
-    <div className="card">
-      <div className="label">{label}</div>
-      <div className="value" style={valueColor ? { color: valueColor } : undefined}>
-        {value}
-      </div>
-      {sub && <div className="sub">{sub}</div>}
-    </div>
-  );
-}
-
-// enriquece a série diária com CPA e ROAS calculados
-function enrich(series) {
-  return (series || []).map((p) => ({
-    ...p,
-    cpa: p.transactions > 0 ? p.spend / p.transactions : null,
-    roas: p.spend > 0 ? p.revenue / p.spend : null,
-    takeRate: p.revenue - p.spend,
-  }));
-}
-
-function DayTable({ series, title }) {
-  const rows = useMemo(() => enrich(series).slice().reverse(), [series]);
-
-  if (rows.length === 0) return null;
-
-  const sum = (k) => rows.reduce((a, r) => a + r[k], 0);
-  const tSpend = sum("spend");
-  const tRevenue = sum("revenue");
-  const tTx = sum("transactions");
-
-  return (
-    <div className="table-card">
-      <div className="legend">
-        <strong style={{ color: "var(--text)" }}>{title}</strong>
-      </div>
-      <div className="table-scroll">
-        <table className="day-table">
-          <thead>
-            <tr>
-              <th>Data</th>
-              <th>Gasto</th>
-              <th>Receita</th>
-              <th>Take rate</th>
-              <th>Transações</th>
-              <th>Ticket</th>
-              <th>CPA</th>
-              <th>ROAS</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((r) => (
-              <tr key={r.date}>
-                <td>{fmtDate(r.date)}</td>
-                <td>{fmtMoney(r.spend)}</td>
-                <td>{fmtMoney(r.revenue)}</td>
-                <td className={r.takeRate >= 0 ? "pos" : "neg"}>
-                  {fmtMoney(r.takeRate)}
-                </td>
-                <td>{fmtNum(r.transactions)}</td>
-                <td>
-                  {fmtMoney(r.transactions > 0 ? r.revenue / r.transactions : null)}
-                </td>
-                <td>{fmtMoney(r.cpa)}</td>
-                <td>{fmtRoas(r.roas)}</td>
-              </tr>
-            ))}
-          </tbody>
-          <tfoot>
-            <tr>
-              <td>Total</td>
-              <td>{fmtMoney(tSpend)}</td>
-              <td>{fmtMoney(tRevenue)}</td>
-              <td className={tRevenue - tSpend >= 0 ? "pos" : "neg"}>
-                {fmtMoney(tRevenue - tSpend)}
-              </td>
-              <td>{fmtNum(tTx)}</td>
-              <td>{fmtMoney(tTx > 0 ? tRevenue / tTx : null)}</td>
-              <td>{fmtMoney(tTx > 0 ? tSpend / tTx : null)}</td>
-              <td>{fmtRoas(tSpend > 0 ? tRevenue / tSpend : null)}</td>
-            </tr>
-          </tfoot>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-const C_SPEND = "#5b9dff";
-const C_REVENUE = "#36d399";
-const C_CPA = "#fbbd23";
-const C_ROAS = "#a78bfa";
-
-function ChartCard({ series, title }) {
-  const [hover, setHover] = useState(null);
-
-  const W = 1080;
-  const H = 260;
-  const pad = { t: 16, r: 48, b: 28, l: 56 };
-  const iw = W - pad.l - pad.r;
-  const ih = H - pad.t - pad.b;
-
-  const points = useMemo(() => enrich(series), [series]);
-
-  // eixo esquerdo: R$ (gasto/receita) · eixo direito: CPA (R$) e ROAS (x)
-  const maxVal = useMemo(() => {
-    let m = 0;
-    for (const p of points) m = Math.max(m, p.spend, p.revenue);
-    return m || 1;
-  }, [points]);
-  const maxR = useMemo(() => {
-    let m = 0;
-    for (const p of points) m = Math.max(m, p.cpa || 0, p.roas || 0);
-    return m || 1;
-  }, [points]);
-
-  if (points.length === 0) {
-    return (
-      <div className="chart-card">
-        <div className="legend">
-          <strong style={{ color: "var(--text)" }}>{title}</strong>
-        </div>
-        <div className="loading">Sem dados no período.</div>
-      </div>
+  const cacheKey = `${from}:${to}`;
+  const hit = memCache.get(cacheKey);
+  if (!force && hit && Date.now() - hit.at < CACHE_TTL_MS && hit.payload.errors.length === 0) {
+    return NextResponse.json(
+      { ...hit.payload, cached: true },
+      { headers: { "Cache-Control": "s-maxage=120, stale-while-revalidate=120" } }
     );
   }
 
-  const x = (i) =>
-    pad.l + (points.length === 1 ? iw / 2 : (i / (points.length - 1)) * iw);
-  const y = (v) => pad.t + ih - (v / maxVal) * ih;
-  const yR = (v) => pad.t + ih - (v / maxR) * ih;
+  const nameProcesso = process.env.GADS_ACCOUNT_PROCESSO || "Verifica Processo";
+  const namePlaca = process.env.GADS_ACCOUNT_PLACA || "Verifica Placa";
 
-  const linePath = (key, scale = y) =>
-    points
-      .map((p, i) => `${i === 0 ? "M" : "L"} ${x(i).toFixed(1)} ${scale(p[key]).toFixed(1)}`)
-      .join(" ");
+  const errors = [];
+  const warnings = [];
+  let gadsRows = [];
+  let txProcesso = [];
+  let txPlaca = [];
 
-  // caminho que pula pontos nulos (dias sem transação não têm CPA/ROAS)
-  const gapPath = (key, scale) => {
-    let d = "";
-    let pen = false;
-    points.forEach((p, i) => {
-      const v = p[key];
-      if (v == null || !Number.isFinite(v)) {
-        pen = false;
-        return;
-      }
-      d += `${pen ? "L" : "M"} ${x(i).toFixed(1)} ${scale(v).toFixed(1)} `;
-      pen = true;
-    });
-    return d.trim();
+  const budget = makeBudget(BUDGET_MS);
+
+  const settle = (p) =>
+    p.then(
+      (value) => ({ status: "fulfilled", value }),
+      (reason) => ({ status: "rejected", reason })
+    );
+  const results = await Promise.all([
+    settle(fetchGoogleAds(from, to, budget)),
+    settle(
+      fetchAbacateTransactions(
+        process.env.ABACATE_KEY_PROCESSO,
+        from,
+        to,
+        warnings,
+        "Processo",
+        budget
+      )
+    ),
+    settle(
+      fetchAbacateTransactions(
+        process.env.ABACATE_KEY_PLACA,
+        from,
+        to,
+        warnings,
+        "Placa",
+        budget
+      )
+    ),
+    settle(
+      fetchStripeTransactions(
+        process.env.STRIPE_KEY_PROCESSO,
+        from,
+        to,
+        warnings,
+        "Processo",
+        budget
+      )
+    ),
+    settle(
+      fetchStripeTransactions(
+        process.env.STRIPE_KEY_PLACA,
+        from,
+        to,
+        warnings,
+        "Placa",
+        budget
+      )
+    ),
+    // hora a hora do último dia da janela — no FIM para não deslocar os
+    // índices de results usados abaixo
+    settle(fetchGoogleAdsHourly(to, budget)),
+  ]);
+
+  const label = (r) =>
+    r.reason?.name === "TimeoutError"
+      ? `demorou mais de ${FETCH_TIMEOUT_MS / 1000}s e foi cancelada`
+      : r.reason?.name === "BudgetError"
+      ? `não terminou dentro do limite de ${Math.round(BUDGET_MS / 1000)}s da rota`
+      : r.reason?.message || String(r.reason);
+
+  if (results[0].status === "fulfilled") gadsRows = results[0].value;
+  else errors.push(`Google Ads: ${label(results[0])}`);
+
+  if (results[1].status === "fulfilled") txProcesso = results[1].value;
+  else errors.push(`Abacate (Processo): ${label(results[1])}`);
+
+  if (results[2].status === "fulfilled") txPlaca = results[2].value;
+  else errors.push(`Abacate (Placa): ${label(results[2])}`);
+
+  // Stripe soma às transações da marca. Falha dela é aviso, não erro fatal.
+  if (results[3].status === "fulfilled") txProcesso = txProcesso.concat(results[3].value);
+  else warnings.push(`Stripe (Processo): ${label(results[3])}`);
+
+  if (results[4].status === "fulfilled") txPlaca = txPlaca.concat(results[4].value);
+  else warnings.push(`Stripe (Placa): ${label(results[4])}`);
+
+  let hourlyRows = [];
+  if (results[5].status === "fulfilled") hourlyRows = results[5].value;
+  else warnings.push(`Google Ads (hora a hora): ${label(results[5])}`);
+
+  const brands = [
+    buildBrand(nameProcesso, gadsRows, txProcesso, from, to),
+    buildBrand(namePlaca, gadsRows, txPlaca, from, to),
+  ];
+
+  // total consolidado
+  const merged = {};
+  const mergedSources = {};
+  for (const br of brands) {
+    for (const s of br.sources || []) {
+      if (!mergedSources[s.source])
+        mergedSources[s.source] = { source: s.source, revenue: 0, transactions: 0 };
+      mergedSources[s.source].revenue += s.revenue;
+      mergedSources[s.source].transactions += s.transactions;
+    }
+    for (const p of br.series) {
+      if (!merged[p.date])
+        merged[p.date] = { date: p.date, spend: 0, revenue: 0, transactions: 0 };
+      merged[p.date].spend += p.spend;
+      merged[p.date].revenue += p.revenue;
+      merged[p.date].transactions += p.transactions;
+    }
+  }
+  const totalSpend = brands.reduce((a, b) => a + b.spend, 0);
+  const totalRevenue = brands.reduce((a, b) => a + b.revenue, 0);
+  const totalTx = brands.reduce((a, b) => a + b.transactions, 0);
+  const totalGadsConv = brands.reduce((a, b) => a + (b.gadsConversions || 0), 0);
+  const totalGadsValue = brands.reduce((a, b) => a + (b.gadsConvValue || 0), 0);
+
+  const total = {
+    name: "Total",
+    spend: totalSpend,
+    revenue: totalRevenue,
+    transactions: totalTx,
+    cpa: totalTx > 0 ? totalSpend / totalTx : null,
+    roas: totalSpend > 0 ? totalRevenue / totalSpend : null,
+    ticket: totalTx > 0 ? totalRevenue / totalTx : null,
+    gadsConversions: totalGadsConv,
+    gadsConvValue: totalGadsValue,
+    series: Object.values(merged).sort((a, b) => (a.date < b.date ? -1 : 1)),
+    sources: Object.values(mergedSources).sort((a, b) => b.revenue - a.revenue),
   };
 
-  const ticks = 4;
-  const gridVals = Array.from({ length: ticks + 1 }, (_, i) => (maxVal / ticks) * i);
+  const payload = {
+    period: { from, to },
+    updatedAt: new Date().toISOString(),
+    total,
+    brands,
+    hourly: { day: to, rows: hourlyRows },
+    errors: [...errors, ...warnings],
+  };
 
-  return (
-    <div className="chart-card" style={{ position: "relative" }}>
-      <div className="legend">
-        <strong style={{ color: "var(--text)", marginRight: "auto" }}>
-          {title}
-        </strong>
-        <span>
-          <i style={{ background: C_SPEND }} /> Gasto
-        </span>
-        <span>
-          <i style={{ background: C_REVENUE }} /> Receita paga
-        </span>
-        <span>
-          <i style={{ background: C_CPA }} /> CPA
-        </span>
-        <span>
-          <i style={{ background: C_ROAS }} /> ROAS
-        </span>
-      </div>
-      <svg
-        viewBox={`0 0 ${W} ${H}`}
-        width="100%"
-        style={{ display: "block" }}
-        onMouseLeave={() => setHover(null)}
-      >
-        {gridVals.map((g, i) => (
-          <g key={i}>
-            <line
-              x1={pad.l}
-              x2={W - pad.r}
-              y1={y(g)}
-              y2={y(g)}
-              stroke="#243044"
-              strokeWidth="1"
-            />
-            <text
-              x={pad.l - 8}
-              y={y(g) + 4}
-              fill="#8b97ab"
-              fontSize="11"
-              textAnchor="end"
-            >
-              {g >= 1000 ? (g / 1000).toFixed(1) + "k" : Math.round(g)}
-            </text>
-            <text
-              x={W - pad.r + 8}
-              y={y(g) + 4}
-              fill="#8b97ab"
-              fontSize="11"
-              textAnchor="start"
-            >
-              {(((maxR / ticks) * i) || 0).toFixed(1)}
-            </text>
-          </g>
-        ))}
+  const complete = errors.length === 0 && warnings.length === 0;
 
-        <path d={linePath("spend")} fill="none" stroke={C_SPEND} strokeWidth="2.5" />
-        <path
-          d={linePath("revenue")}
-          fill="none"
-          stroke={C_REVENUE}
-          strokeWidth="2.5"
-        />
-        <path
-          d={gapPath("cpa", yR)}
-          fill="none"
-          stroke={C_CPA}
-          strokeWidth="2"
-          strokeDasharray="5 4"
-        />
-        <path
-          d={gapPath("roas", yR)}
-          fill="none"
-          stroke={C_ROAS}
-          strokeWidth="2"
-          strokeDasharray="5 4"
-        />
+  if (complete) {
+    memCache.set(cacheKey, { at: Date.now(), payload });
+    lastGood.set(cacheKey, payload);
+    return NextResponse.json(payload, {
+      headers: {
+        "Cache-Control": force
+          ? "no-store"
+          : "s-maxage=120, stale-while-revalidate=120",
+      },
+    });
+  }
 
-        {points.map((p, i) => (
-          <g key={i}>
-            <circle cx={x(i)} cy={y(p.spend)} r="2.5" fill={C_SPEND} />
-            <circle cx={x(i)} cy={y(p.revenue)} r="2.5" fill={C_REVENUE} />
-            {p.cpa != null && (
-              <circle cx={x(i)} cy={yR(p.cpa)} r="2" fill={C_CPA} />
-            )}
-            {p.roas != null && (
-              <circle cx={x(i)} cy={yR(p.roas)} r="2" fill={C_ROAS} />
-            )}
-            <rect
-              x={x(i) - (iw / points.length) / 2}
-              y={pad.t}
-              width={iw / points.length}
-              height={ih}
-              fill="transparent"
-              onMouseEnter={() => setHover({ i, px: x(i) })}
-            />
-          </g>
-        ))}
+  const good = lastGood.get(cacheKey);
+  if (good) {
+    const hora = new Date(good.updatedAt).toLocaleTimeString("pt-BR", {
+      timeZone: TZ,
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    return NextResponse.json(
+      {
+        ...good,
+        stale: true,
+        errors: [
+          `Fontes instáveis agora — mostrando os últimos dados completos (${hora}).`,
+          ...payload.errors,
+        ],
+      },
+      { headers: { "Cache-Control": "no-store" } }
+    );
+  }
 
-        {points.map((p, i) =>
-          i % Math.ceil(points.length / 10) === 0 ? (
-            <text
-              key={i}
-              x={x(i)}
-              y={H - 8}
-              fill="#8b97ab"
-              fontSize="10"
-              textAnchor="middle"
-            >
-              {fmtDate(p.date)}
-            </text>
-          ) : null
-        )}
-      </svg>
-
-      {hover && (
-        <div
-          className="tooltip"
-          style={{
-            left: `${(hover.px / W) * 100}%`,
-            top: 70,
-          }}
-        >
-          <b>{fmtDate(points[hover.i].date)}</b>
-          <div className="t-row">Gasto: {fmtMoney(points[hover.i].spend)}</div>
-          <div className="t-row">Receita: {fmtMoney(points[hover.i].revenue)}</div>
-          <div className="t-row">
-            Take rate: {fmtMoney(points[hover.i].takeRate)}
-          </div>
-          <div className="t-row">
-            Transações: {fmtNum(points[hover.i].transactions)}
-          </div>
-          <div className="t-row">CPA: {fmtMoney(points[hover.i].cpa)}</div>
-          <div className="t-row">ROAS: {fmtRoas(points[hover.i].roas)}</div>
-        </div>
-      )}
-    </div>
-  );
+  return NextResponse.json(payload, {
+    headers: { "Cache-Control": "no-store" },
+  });
 }
