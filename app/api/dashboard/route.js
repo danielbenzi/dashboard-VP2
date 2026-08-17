@@ -9,7 +9,16 @@ const ABACATE_V2 = "https://api.abacatepay.com/v2";
 const ABACATE_V1 = "https://api.abacatepay.com/v1";
 
 // Timeout por chamada externa: falha rápido em vez de derrubar a rota inteira (504)
-const FETCH_TIMEOUT_MS = 15000;
+const FETCH_TIMEOUT_MS = 8000;
+// Orçamento GLOBAL da rota. Precisa ficar confortavelmente abaixo de maxDuration,
+// senão o Vercel mata a função no meio e o gateway devolve 504 — a resposta vira
+// uma página de erro e o dashboard não renderiza NADA. Com orçamento, a rota
+// sempre devolve JSON a tempo: no pior caso, dados parciais + avisos.
+const BUDGET_MS = Number(process.env.DASHBOARD_BUDGET_MS || 40000);
+// Tentativas por chamada ao Abacate (a API falha de forma intermitente)
+const MAX_ATTEMPTS = 3;
+// Teto de páginas por listagem
+const MAX_PAGES = 30;
 // Cache em memória (por instância warm da função): evita rebuscar tudo a cada load
 const CACHE_TTL_MS = 2 * 60 * 1000;
 const memCache = new Map(); // key -> { at, payload }
@@ -41,17 +50,36 @@ function inRange(dateStr, from, to) {
   return dateStr >= from && dateStr <= to;
 }
 
-// fetch com timeout
-function tFetch(url, opts = {}) {
+// relógio global da requisição: todo trabalho externo consulta ele antes de
+// gastar mais tempo, para a rota nunca ultrapassar maxDuration
+function makeBudget(ms) {
+  const end = Date.now() + ms;
+  return {
+    left: () => end - Date.now(),
+    expired: () => Date.now() >= end,
+  };
+}
+
+function budgetError() {
+  const e = new Error("tempo da requisição esgotado antes de terminar a busca");
+  e.name = "BudgetError";
+  return e;
+}
+
+// fetch com timeout, limitado ao que ainda resta do orçamento global
+function tFetch(url, opts = {}, budget) {
+  const left = budget ? budget.left() : FETCH_TIMEOUT_MS;
+  const ms = Math.min(FETCH_TIMEOUT_MS, left);
+  if (ms <= 0) throw budgetError();
   return fetch(url, {
     ...opts,
     cache: "no-store",
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    signal: AbortSignal.timeout(ms),
   });
 }
 
 // ---------- Google Ads (via Windsor.ai) ----------
-async function fetchGoogleAds(from, to) {
+async function fetchGoogleAds(from, to, budget) {
   const key = process.env.WINDSOR_API_KEY;
   if (!key) throw new Error("WINDSOR_API_KEY não configurada");
 
@@ -70,7 +98,7 @@ async function fetchGoogleAds(from, to) {
     `&date_from=${from}&date_to=${to}` +
     `&fields=${fields}`;
 
-  const res = await tFetch(url);
+  const res = await tFetch(url, {}, budget);
   if (!res.ok) {
     if (res.status === 401 || res.status === 403) {
       throw new Error(
@@ -88,17 +116,27 @@ async function fetchGoogleAds(from, to) {
 // ---------- AbacatePay ----------
 // A API do Abacate falha de forma intermitente ({"success":false,"data":null}).
 // Retry com backoff: até 3 tentativas antes de desistir.
-async function abFetch(url, apiKey) {
+async function abFetch(url, apiKey, budget) {
   let last = null;
-  for (let attempt = 0; attempt < 4; attempt++) {
-    if (attempt > 0) await new Promise((r) => setTimeout(r, 800 * 2 ** (attempt - 1)));
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    if (budget.expired()) break;
+    if (attempt > 0) {
+      // só espera o backoff se ainda sobrar orçamento para a tentativa em si
+      const wait = Math.min(600 * 2 ** (attempt - 1), budget.left() - 1000);
+      if (wait <= 0) break;
+      await new Promise((r) => setTimeout(r, wait));
+    }
     try {
-      const res = await tFetch(url, {
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
+      const res = await tFetch(
+        url,
+        {
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+          },
         },
-      });
+        budget
+      );
       const text = await res.text();
       let json = null;
       try {
@@ -112,6 +150,8 @@ async function abFetch(url, apiKey) {
       // erro de autenticação não se resolve com retry
       if (res.status === 401 || res.status === 403) break;
     } catch (e) {
+      // orçamento estourado: parar já, não queimar o que resta em retries
+      if (e?.name === "BudgetError") break;
       last = {
         res: { ok: false, status: 0 },
         json: null,
@@ -119,7 +159,14 @@ async function abFetch(url, apiKey) {
       };
     }
   }
-  return last;
+  // nunca devolve null: o chamador desestrutura o resultado
+  return (
+    last || {
+      res: { ok: false, status: 0 },
+      json: null,
+      text: "tempo da requisição esgotado",
+    }
+  );
 }
 
 // converte timestamp (UTC) para a data em America/Sao_Paulo —
@@ -146,20 +193,24 @@ function normalizeTx(it) {
 // já são todas anteriores a `from` (evita varrer o histórico inteiro).
 // Se a API rejeitar o filtro ?status= com HTTP 400 (acontece de forma
 // intermitente), refaz a listagem SEM o filtro e filtra aqui no código.
-async function listV2(path, paidStatus, apiKey, from, useStatusParam = true) {
+async function listV2(path, paidStatus, apiKey, from, budget, onTruncate, useStatusParam = true) {
   const out = [];
   let after = null;
-  for (let page = 0; page < 50; page++) {
+  let truncated = true; // vira false assim que a paginação terminar naturalmente
+  for (let page = 0; page < MAX_PAGES; page++) {
+    // parar de paginar antes de estourar o tempo da rota
+    if (budget.expired()) throw budgetError();
+
     const u = new URL(`${ABACATE_V2}${path}`);
     u.searchParams.set("limit", "100");
     if (useStatusParam) u.searchParams.set("status", paidStatus);
     if (after) u.searchParams.set("after", after);
 
-    const { res, json, text } = await abFetch(u.toString(), apiKey);
+    const { res, json, text } = await abFetch(u.toString(), apiKey, budget);
     if (!res.ok || (json && json.success === false)) {
       if (res.status === 400 && useStatusParam) {
         // plano B: lista sem o filtro de status e filtra client-side
-        return listV2(path, paidStatus, apiKey, from, false);
+        return listV2(path, paidStatus, apiKey, from, budget, onTruncate, false);
       }
       const err = new Error(
         `HTTP ${res.status} (página ${page + 1}): ${text.slice(0, 200)}`
@@ -180,28 +231,41 @@ async function listV2(path, paidStatus, apiKey, from, useStatusParam = true) {
     // dele, o id do último item.
     const pg = (json && json.pagination) || {};
     const fullPage = raw.length >= 100;
-    if (!fullPage && pg.hasMore !== true) break;
+    if (!fullPage && pg.hasMore !== true) {
+      truncated = false;
+      break;
+    }
 
-    // parada antecipada: se a lista vem em ordem decrescente de data e a página
-    // inteira já é mais antiga que `from`, as próximas também serão
+    // parada antecipada: se a lista vem em ordem decrescente de data e o item
+    // MAIS ANTIGO desta página já é anterior a `from`, as próximas páginas são
+    // todas anteriores também (os itens úteis desta página já foram coletados).
     if (from && raw.length > 1) {
       const dFirst = txDate(raw[0]);
       const dLast = txDate(raw[raw.length - 1]);
       const descending = dFirst >= dLast;
-      if (descending && dFirst && dFirst < from) break;
+      if (descending && dLast && dLast < from) {
+        truncated = false;
+        break;
+      }
     }
 
     let next = pg.next || pg.after || null;
     if (!next && raw.length > 0) next = raw[raw.length - 1].id;
-    if (!next || next === after) break;
+    if (!next || next === after) {
+      truncated = false;
+      break;
+    }
     after = next;
   }
+  // bateu no teto de páginas: há mais dados que não foram lidos. Isso NÃO pode
+  // passar em silêncio — a receita sairia menor sem ninguém perceber.
+  if (truncated && onTruncate) onTruncate(path, out.length);
   return out;
 }
 
 // v1 (chaves antigas): /billing/list devolve tudo; filtramos PAID
-async function listV1Billings(apiKey) {
-  const { res, json, text } = await abFetch(`${ABACATE_V1}/billing/list`, apiKey);
+async function listV1Billings(apiKey, budget) {
+  const { res, json, text } = await abFetch(`${ABACATE_V1}/billing/list`, apiKey, budget);
   if (!res.ok || (json && json.success === false)) {
     const err = new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
     err.status = res.status;
@@ -215,7 +279,7 @@ async function listV1Billings(apiKey) {
 // Busca as transações pagas de uma marca. Tenta v2; se a chave for v1, cai para v1.
 // Erros parciais (transparents/pix) NÃO são engolidos: vão para `warnings`,
 // para o dashboard nunca mostrar receita menor silenciosamente.
-async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel) {
+async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel, budget) {
   if (!apiKey) return [];
 
   try {
@@ -235,7 +299,12 @@ async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel) {
     for (const p of paths) {
       const cacheKey = `${apiKey.slice(0, 12)}:${p}:${from}`;
       try {
-        const value = await listV2(p, "PAID", apiKey, from);
+        const onTruncate = (pth, n) =>
+          warnings.push(
+            `Abacate (${brandLabel}${pth}): atingiu o limite de ${MAX_PAGES} páginas ` +
+              `(${n} registros lidos) — pode haver transações não contabilizadas.`
+          );
+        const value = await listV2(p, "PAID", apiKey, from, budget, onTruncate);
         srcCache.set(cacheKey, { at: Date.now(), items: value });
         settled.push({ status: "fulfilled", value });
       } catch (reason) {
@@ -283,7 +352,7 @@ async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel) {
       /version mismatch/i.test(e.body || e.message || "") || e.status === 401;
     if (!isVersionMismatch) throw e;
     // ---- fallback v1 ----
-    const billings = await listV1Billings(apiKey);
+    const billings = await listV1Billings(apiKey, budget);
     return billings.map(normalizeTx);
   }
 }
@@ -372,24 +441,44 @@ export async function GET(request) {
   let txProcesso = [];
   let txPlaca = [];
 
-  // Google Ads em paralelo; marcas do Abacate em SEQUÊNCIA (rate limit)
+  const budget = makeBudget(BUDGET_MS);
+
+  // As três fontes rodam em PARALELO. As duas marcas do Abacate usam chaves
+  // (contas) diferentes, então têm buckets de rate limit separados — o que
+  // precisa ser serializado é a lista de endpoints DENTRO de cada marca, e isso
+  // continua sequencial em fetchAbacateTransactions.
   const settle = (p) =>
     p.then(
       (value) => ({ status: "fulfilled", value }),
       (reason) => ({ status: "rejected", reason })
     );
-  const gadsPromise = settle(fetchGoogleAds(from, to));
-  const rProcesso = await settle(
-    fetchAbacateTransactions(process.env.ABACATE_KEY_PROCESSO, from, warnings, "Processo")
-  );
-  const rPlaca = await settle(
-    fetchAbacateTransactions(process.env.ABACATE_KEY_PLACA, from, warnings, "Placa")
-  );
-  const results = [await gadsPromise, rProcesso, rPlaca];
+  const results = await Promise.all([
+    settle(fetchGoogleAds(from, to, budget)),
+    settle(
+      fetchAbacateTransactions(
+        process.env.ABACATE_KEY_PROCESSO,
+        from,
+        warnings,
+        "Processo",
+        budget
+      )
+    ),
+    settle(
+      fetchAbacateTransactions(
+        process.env.ABACATE_KEY_PLACA,
+        from,
+        warnings,
+        "Placa",
+        budget
+      )
+    ),
+  ]);
 
   const label = (r) =>
     r.reason?.name === "TimeoutError"
       ? `demorou mais de ${FETCH_TIMEOUT_MS / 1000}s e foi cancelada`
+      : r.reason?.name === "BudgetError"
+      ? `não terminou dentro do limite de ${Math.round(BUDGET_MS / 1000)}s da rota`
       : r.reason?.message || String(r.reason);
 
   if (results[0].status === "fulfilled") gadsRows = results[0].value;
