@@ -7,6 +7,7 @@ export const maxDuration = 60;
 const WINDSOR_BASE = "https://connectors.windsor.ai/google_ads";
 const ABACATE_V2 = "https://api.abacatepay.com/v2";
 const ABACATE_V1 = "https://api.abacatepay.com/v1";
+const STRIPE_BASE = "https://api.stripe.com/v1";
 
 // Timeout por chamada externa: falha rápido em vez de derrubar a rota inteira (504)
 const FETCH_TIMEOUT_MS = 8000;
@@ -57,6 +58,17 @@ function makeBudget(ms) {
   return {
     left: () => end - Date.now(),
     expired: () => Date.now() >= end,
+  };
+}
+
+// sub-orçamento: nunca ultrapassa o orçamento pai, mas limita quanto UMA etapa
+// pode consumir. Sem isso, um endpoint lento come todo o tempo e os seguintes
+// nem chegam a ser tentados (foi o que aconteceu com payment-links/subscriptions).
+function sliceBudget(parent, ms) {
+  const end = Date.now() + ms;
+  return {
+    left: () => Math.min(parent.left(), end - Date.now()),
+    expired: () => parent.expired() || Date.now() >= end,
   };
 }
 
@@ -208,7 +220,11 @@ async function listV2(path, paidStatus, apiKey, from, budget, onTruncate, useSta
 
     const { res, json, text } = await abFetch(u.toString(), apiKey, budget);
     if (!res.ok || (json && json.success === false)) {
-      if (res.status === 400 && useStatusParam) {
+      // A API rejeita o filtro ?status= de formas diferentes conforme o
+      // endpoint: 400 nos checkouts, 422 em /subscriptions ("Property 'status'
+      // should be one of ..."), porque lá os status válidos são outros.
+      // Em qualquer um dos casos o plano B é o mesmo: listar sem o filtro.
+      if ((res.status === 400 || res.status === 422) && useStatusParam) {
         // plano B: lista sem o filtro de status e filtra client-side
         return listV2(path, paidStatus, apiKey, from, budget, onTruncate, false);
       }
@@ -296,7 +312,13 @@ async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel, budg
       "/subscriptions/list",
     ];
     const settled = [];
-    for (const p of paths) {
+    for (let i = 0; i < paths.length; i++) {
+      const p = paths[i];
+      // divide o tempo que resta entre os endpoints que ainda faltam. Quem
+      // termina rápido devolve a sobra para os próximos; quem trava só
+      // queima a própria fatia.
+      const share = Math.floor(budget.left() / (paths.length - i));
+      const slice = sliceBudget(budget, share);
       const cacheKey = `${apiKey.slice(0, 12)}:${p}:${from}`;
       try {
         const onTruncate = (pth, n) =>
@@ -304,7 +326,7 @@ async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel, budg
             `Abacate (${brandLabel}${pth}): atingiu o limite de ${MAX_PAGES} páginas ` +
               `(${n} registros lidos) — pode haver transações não contabilizadas.`
           );
-        const value = await listV2(p, "PAID", apiKey, from, budget, onTruncate);
+        const value = await listV2(p, "PAID", apiKey, from, slice, onTruncate);
         srcCache.set(cacheKey, { at: Date.now(), items: value });
         settled.push({ status: "fulfilled", value });
       } catch (reason) {
@@ -355,6 +377,87 @@ async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel, budg
     const billings = await listV1Billings(apiKey, budget);
     return billings.map(normalizeTx);
   }
+}
+
+// ---------- Stripe (pagamentos com cartão) ----------
+// O Brasil não usa horário de verão desde 2019, então o offset de São Paulo é
+// fixo em -03:00 — dá para converter a borda do dia sem depender de tz database.
+function brtToUnix(dateStr, endOfDay) {
+  const t = endOfDay ? "23:59:59" : "00:00:00";
+  return Math.floor(new Date(`${dateStr}T${t}-03:00`).getTime() / 1000);
+}
+
+// Diferente do Abacate, a Stripe filtra por data NO SERVIDOR (created[gte]/[lte]),
+// então não é preciso varrer o histórico inteiro — só as cobranças do período.
+async function fetchStripeTransactions(apiKey, from, to, warnings, brandLabel, budget) {
+  if (!apiKey) return [];
+
+  const out = [];
+  let startingAfter = null;
+  let truncated = true;
+
+  for (let page = 0; page < MAX_PAGES; page++) {
+    if (budget.expired()) throw budgetError();
+
+    const u = new URL(`${STRIPE_BASE}/charges`);
+    u.searchParams.set("limit", "100");
+    u.searchParams.set("created[gte]", String(brtToUnix(from, false)));
+    u.searchParams.set("created[lte]", String(brtToUnix(to, true)));
+    if (startingAfter) u.searchParams.set("starting_after", startingAfter);
+
+    const res = await tFetch(
+      u.toString(),
+      { headers: { Authorization: `Bearer ${apiKey}` } },
+      budget
+    );
+    const text = await res.text();
+    let json = null;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      /* resposta não-JSON */
+    }
+    if (!res.ok) {
+      const msg = json?.error?.message || text.slice(0, 200);
+      const err = new Error(`HTTP ${res.status} (página ${page + 1}): ${msg}`);
+      err.status = res.status;
+      throw err;
+    }
+
+    const raw = (json && json.data) || [];
+    for (const ch of raw) {
+      // só cobrança efetivamente capturada; estorno abate do valor
+      if (ch.status !== "succeeded" || !ch.paid) continue;
+      const gross = num(ch.amount_captured != null ? ch.amount_captured : ch.amount);
+      const net = gross - num(ch.amount_refunded);
+      if (net <= 0) continue; // totalmente estornada
+      out.push({
+        amount: net / 100,
+        date: new Date(num(ch.created) * 1000).toLocaleDateString("en-CA", {
+          timeZone: TZ,
+        }),
+      });
+    }
+
+    if (!json?.has_more || raw.length === 0) {
+      truncated = false;
+      break;
+    }
+    const next = raw[raw.length - 1].id;
+    if (!next || next === startingAfter) {
+      truncated = false;
+      break;
+    }
+    startingAfter = next;
+  }
+
+  if (truncated) {
+    warnings.push(
+      `Stripe (${brandLabel}): atingiu o limite de ${MAX_PAGES} páginas ` +
+        `(${out.length} cobranças lidas) — pode haver pagamentos não contabilizados.`
+    );
+  }
+  return out;
 }
 
 // agrega uma marca: junta gasto (Google) + receita/transações (Abacate)
@@ -472,6 +575,28 @@ export async function GET(request) {
         budget
       )
     ),
+    // Stripe é outro provedor: sem rate limit compartilhado com o Abacate,
+    // e filtra por data no servidor, então roda em paralelo sem custo.
+    settle(
+      fetchStripeTransactions(
+        process.env.STRIPE_KEY_PROCESSO,
+        from,
+        to,
+        warnings,
+        "Processo",
+        budget
+      )
+    ),
+    settle(
+      fetchStripeTransactions(
+        process.env.STRIPE_KEY_PLACA,
+        from,
+        to,
+        warnings,
+        "Placa",
+        budget
+      )
+    ),
   ]);
 
   const label = (r) =>
@@ -489,6 +614,14 @@ export async function GET(request) {
 
   if (results[2].status === "fulfilled") txPlaca = results[2].value;
   else errors.push(`Abacate (Placa): ${label(results[2])}`);
+
+  // Stripe soma às transações da marca (cartão + PIX/boleto do Abacate).
+  // Falha da Stripe é aviso, não erro fatal: o Abacate continua valendo.
+  if (results[3].status === "fulfilled") txProcesso = txProcesso.concat(results[3].value);
+  else warnings.push(`Stripe (Processo): ${label(results[3])}`);
+
+  if (results[4].status === "fulfilled") txPlaca = txPlaca.concat(results[4].value);
+  else warnings.push(`Stripe (Placa): ${label(results[4])}`);
 
   const brands = [
     buildBrand(nameProcesso, gadsRows, txProcesso, from, to),
