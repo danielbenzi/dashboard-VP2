@@ -55,6 +55,15 @@ export default function Page() {
     const ctrl = new AbortController();
     abortRef.current = ctrl;
 
+    // rede de segurança: a API tem orçamento próprio (~40s) e sempre responde
+    // antes disso; se mesmo assim nada voltar, aborta com mensagem clara em vez
+    // de deixar a tela em "Carregando…" para sempre
+    let timedOut = false;
+    const killer = setTimeout(() => {
+      timedOut = true;
+      ctrl.abort();
+    }, 60000);
+
     setLoading(true);
     setErr(null);
     try {
@@ -83,9 +92,15 @@ export default function Page() {
       if (!json) throw new Error("Resposta inválida do servidor.");
       setData(json);
     } catch (e) {
-      if (e.name === "AbortError") return;
-      setErr(e.message);
+      if (e.name === "AbortError") {
+        // abortado pela rede de segurança (≠ cancelado por um request novo)
+        if (!timedOut) return;
+        setErr("O servidor demorou demais para responder. Tente novamente.");
+      } else {
+        setErr(e.message);
+      }
     } finally {
+      clearTimeout(killer);
       if (abortRef.current === ctrl) setLoading(false);
     }
   }
