@@ -22,6 +22,16 @@ const BUDGET_MS = Number(process.env.DASHBOARD_BUDGET_MS || 45000);
 const MAX_ATTEMPTS = 3;
 // Teto de páginas por listagem
 const MAX_PAGES = 30;
+// Endpoints de receita do Abacate, na ordem de prioridade (o primeiro é o
+// obrigatório). Sobrescrevível por ABACATE_ENDPOINTS para desligar produtos
+// que a conta não usa e que respondem 400 permanentemente.
+const ABACATE_PATHS = (
+  process.env.ABACATE_ENDPOINTS ||
+  "/checkouts/list,/transparents/list,/payment-links/list,/subscriptions/list"
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 // Cache em memória (por instância warm da função): evita rebuscar tudo a cada load
 const CACHE_TTL_MS = 2 * 60 * 1000;
 const memCache = new Map(); // key -> { at, payload }
@@ -230,8 +240,11 @@ async function listV2(path, paidStatus, apiKey, from, budget, onTruncate, useSta
         // plano B: lista sem o filtro de status e filtra client-side
         return listV2(path, paidStatus, apiKey, from, budget, onTruncate, false);
       }
+      // se já estamos SEM o filtro de status, é porque o plano B também falhou:
+      // deixar isso explícito evita diagnosticar como erro simples de filtro.
+      const tried = useStatusParam ? "" : " (também sem o filtro de status)";
       const err = new Error(
-        `HTTP ${res.status} (página ${page + 1}): ${text.slice(0, 200)}`
+        `HTTP ${res.status} (página ${page + 1})${tried}: ${text.slice(0, 200)}`
       );
       err.status = res.status;
       err.body = text;
@@ -307,17 +320,19 @@ async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel, budg
     // links de pagamento e assinaturas.
     // Chamadas SEQUENCIAIS (não paralelas) para não estourar o rate limit
     // do Abacate — as falhas HTTP 400 intermitentes acontecem sob rajada.
-    const paths = [
-      "/checkouts/list",
-      "/transparents/list",
-      "/payment-links/list",
-      "/subscriptions/list",
-    ];
-    // Fatias PONDERADAS, não iguais: /checkouts é obrigatório (se ele falha, a
-    // marca inteira falha) e concentra a maior parte da receita, então leva
-    // metade do tempo. Com fatias iguais ele ficava com uma única tentativa e
-    // passou a estourar por timeout — os outros três são complementares.
-    const weights = [0.5, 0.2, 0.15, 0.15];
+    // Configurável: nem toda conta usa todos os produtos do Abacate, e um
+    // endpoint que a conta não tem responde HTTP 400 para sempre — vira ruído
+    // permanente no dashboard. Para desligar, defina ABACATE_ENDPOINTS com a
+    // lista separada por vírgula. O primeiro da lista é tratado como o
+    // obrigatório. Ex.: "/checkouts/list,/payment-links/list"
+    const paths = ABACATE_PATHS;
+    // Fatias PONDERADAS, não iguais: o primeiro endpoint é obrigatório (se ele
+    // falha, a marca inteira falha) e concentra a maior parte da receita, então
+    // leva metade do tempo. Com fatias iguais ele ficava com uma única
+    // tentativa e estourava por timeout — os demais são complementares.
+    const weights = paths.map((_, i) =>
+      i === 0 ? 0.5 : 0.5 / Math.max(1, paths.length - 1)
+    );
     const settled = [];
     for (let i = 0; i < paths.length; i++) {
       const p = paths[i];
@@ -357,7 +372,8 @@ async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel, budg
     // checkouts é obrigatório; se falhar, propaga (pode ser chave v1)
     if (settled[0].status === "rejected") throw settled[0].reason;
 
-    const labels = ["checkouts", "transparents", "payment-links", "subscriptions"];
+    // derivado de paths: "/payment-links/list" -> "payment-links"
+    const labels = paths.map((p) => p.split("/").filter(Boolean)[0] || p);
     const lists = [];
     settled.forEach((r, i) => {
       if (r.status === "fulfilled") lists.push(r.value);
