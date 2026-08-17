@@ -9,13 +9,15 @@ const ABACATE_V2 = "https://api.abacatepay.com/v2";
 const ABACATE_V1 = "https://api.abacatepay.com/v1";
 const STRIPE_BASE = "https://api.stripe.com/v1";
 
-// Timeout por chamada externa: falha rápido em vez de derrubar a rota inteira (504)
-const FETCH_TIMEOUT_MS = 8000;
+// Timeout por chamada externa. O Abacate às vezes passa de 8s para responder;
+// como o orçamento global já protege a rota do 504, dá para ser mais paciente
+// aqui do que seria seguro sem ele.
+const FETCH_TIMEOUT_MS = 12000;
 // Orçamento GLOBAL da rota. Precisa ficar confortavelmente abaixo de maxDuration,
 // senão o Vercel mata a função no meio e o gateway devolve 504 — a resposta vira
 // uma página de erro e o dashboard não renderiza NADA. Com orçamento, a rota
 // sempre devolve JSON a tempo: no pior caso, dados parciais + avisos.
-const BUDGET_MS = Number(process.env.DASHBOARD_BUDGET_MS || 40000);
+const BUDGET_MS = Number(process.env.DASHBOARD_BUDGET_MS || 45000);
 // Tentativas por chamada ao Abacate (a API falha de forma intermitente)
 const MAX_ATTEMPTS = 3;
 // Teto de páginas por listagem
@@ -311,13 +313,18 @@ async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel, budg
       "/payment-links/list",
       "/subscriptions/list",
     ];
+    // Fatias PONDERADAS, não iguais: /checkouts é obrigatório (se ele falha, a
+    // marca inteira falha) e concentra a maior parte da receita, então leva
+    // metade do tempo. Com fatias iguais ele ficava com uma única tentativa e
+    // passou a estourar por timeout — os outros três são complementares.
+    const weights = [0.5, 0.2, 0.15, 0.15];
     const settled = [];
     for (let i = 0; i < paths.length; i++) {
       const p = paths[i];
-      // divide o tempo que resta entre os endpoints que ainda faltam. Quem
-      // termina rápido devolve a sobra para os próximos; quem trava só
-      // queima a própria fatia.
-      const share = Math.floor(budget.left() / (paths.length - i));
+      // proporcional ao peso restante: quem termina rápido devolve a sobra
+      // para os próximos; quem trava só queima a própria fatia.
+      const restWeight = weights.slice(i).reduce((a, b) => a + b, 0);
+      const share = Math.floor((budget.left() * weights[i]) / restWeight);
       const slice = sliceBudget(budget, share);
       const cacheKey = `${apiKey.slice(0, 12)}:${p}:${from}`;
       try {
