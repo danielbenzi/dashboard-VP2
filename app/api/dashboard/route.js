@@ -17,11 +17,17 @@ const FETCH_TIMEOUT_MS = 12000;
 // senão o Vercel mata a função no meio e o gateway devolve 504 — a resposta vira
 // uma página de erro e o dashboard não renderiza NADA. Com orçamento, a rota
 // sempre devolve JSON a tempo: no pior caso, dados parciais + avisos.
-const BUDGET_MS = Number(process.env.DASHBOARD_BUDGET_MS || 45000);
+const BUDGET_MS = Number(process.env.DASHBOARD_BUDGET_MS || 50000);
 // Tentativas por chamada ao Abacate (a API falha de forma intermitente)
 const MAX_ATTEMPTS = 3;
 // Teto de páginas por listagem
 const MAX_PAGES = 30;
+// Registros por página do Abacate. Página menor responde mais rápido (o
+// timeout na página 2 com limit=100 foi o que zerava a receita do Abacate),
+// ao custo de mais idas e voltas. Ajustável sem mexer no código.
+const ABACATE_PAGE_LIMIT = String(
+  Number(process.env.ABACATE_PAGE_LIMIT) || 50
+);
 // Endpoints de receita do Abacate, na ordem de prioridade (o primeiro é o
 // obrigatório). Sobrescrevível por ABACATE_ENDPOINTS para desligar produtos
 // que a conta não usa e que respondem 400 permanentemente.
@@ -221,12 +227,31 @@ async function listV2(path, paidStatus, apiKey, from, budget, onTruncate, useSta
   const out = [];
   let after = null;
   let truncated = true; // vira false assim que a paginação terminar naturalmente
-  for (let page = 0; page < MAX_PAGES; page++) {
+  let page = 0;
+
+  // Falha no MEIO da paginação não pode descartar o que já foi lido: as páginas
+  // anteriores são transações reais e pagas. Só propaga o erro se nada tiver
+  // sido coletado ainda — aí não há o que salvar.
+  const bail = (err) => {
+    if (out.length > 0) {
+      if (onTruncate) {
+        onTruncate(
+          path,
+          out.length,
+          `parou na página ${page + 1} (${err.message}) — resultado PARCIAL`
+        );
+      }
+      return out;
+    }
+    throw err;
+  };
+
+  for (; page < MAX_PAGES; page++) {
     // parar de paginar antes de estourar o tempo da rota
-    if (budget.expired()) throw budgetError();
+    if (budget.expired()) return bail(budgetError());
 
     const u = new URL(`${ABACATE_V2}${path}`);
-    u.searchParams.set("limit", "100");
+    u.searchParams.set("limit", ABACATE_PAGE_LIMIT);
     if (useStatusParam) u.searchParams.set("status", paidStatus);
     if (after) u.searchParams.set("after", after);
 
@@ -248,7 +273,7 @@ async function listV2(path, paidStatus, apiKey, from, budget, onTruncate, useSta
       );
       err.status = res.status;
       err.body = text;
-      throw err;
+      return bail(err);
     }
     const raw = (json && json.data) || [];
     const items = useStatusParam
@@ -257,11 +282,11 @@ async function listV2(path, paidStatus, apiKey, from, budget, onTruncate, useSta
     for (const it of items) out.push(it);
 
     // Paginação: a doc promete pagination: { hasMore, next }, mas na prática
-    // a API nem sempre devolve esses campos. Regra: se a página veio CHEIA
-    // (100 itens), assume que há mais; cursor = pagination.next ou, na falta
-    // dele, o id do último item.
+    // a API nem sempre devolve esses campos. Regra: se a página veio CHEIA,
+    // assume que há mais; cursor = pagination.next ou, na falta dele, o id do
+    // último item.
     const pg = (json && json.pagination) || {};
-    const fullPage = raw.length >= 100;
+    const fullPage = raw.length >= Number(ABACATE_PAGE_LIMIT);
     if (!fullPage && pg.hasMore !== true) {
       truncated = false;
       break;
@@ -343,10 +368,11 @@ async function fetchAbacateTransactions(apiKey, from, warnings, brandLabel, budg
       const slice = sliceBudget(budget, share);
       const cacheKey = `${apiKey.slice(0, 12)}:${p}:${from}`;
       try {
-        const onTruncate = (pth, n) =>
+        const onTruncate = (pth, n, reason) =>
           warnings.push(
-            `Abacate (${brandLabel}${pth}): atingiu o limite de ${MAX_PAGES} páginas ` +
-              `(${n} registros lidos) — pode haver transações não contabilizadas.`
+            `Abacate (${brandLabel}${pth}): ` +
+              `${reason || `atingiu o limite de ${MAX_PAGES} páginas`} — ` +
+              `${n} transações contabilizadas, pode haver outras faltando.`
           );
         const value = await listV2(p, "PAID", apiKey, from, slice, onTruncate);
         srcCache.set(cacheKey, { at: Date.now(), items: value });
@@ -583,7 +609,7 @@ export async function GET(request) {
 
   const budget = makeBudget(BUDGET_MS);
 
-  // As três fontes rodam em PARALELO. As duas marcas do Abacate usam chaves
+  // As fontes rodam em PARALELO. As duas marcas do Abacate usam chaves
   // (contas) diferentes, então têm buckets de rate limit separados — o que
   // precisa ser serializado é a lista de endpoints DENTRO de cada marca, e isso
   // continua sequencial em fetchAbacateTransactions.
