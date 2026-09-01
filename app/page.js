@@ -127,6 +127,7 @@ export default function Page() {
           <h1>Verifica Processo &amp; Verifica Placa</h1>
           <p>
             Gasto, transações, CPA, ROAS e receita paga · Google Ads + AbacatePay
+            + PushinPay + Stripe
             {data?.updatedAt && (
               <>
                 {" "}
