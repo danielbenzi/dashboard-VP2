@@ -100,13 +100,10 @@ body {
 
 .cards {
   display: grid;
-  grid-template-columns: repeat(6, 1fr);
+  /* auto-fit em vez de 6 colunas fixas: o card de Conversão entrou como
+     sétimo e uma grade fixa deixaria um órfão sozinho na segunda linha */
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 12px;
-}
-@media (max-width: 1024px) {
-  .cards {
-    grid-template-columns: repeat(3, 1fr);
-  }
 }
 @media (max-width: 640px) {
   .cards {
