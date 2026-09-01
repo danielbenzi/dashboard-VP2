@@ -16,6 +16,10 @@ function fmtNum(v) {
   if (v == null || !Number.isFinite(v)) return "—";
   return NUM.format(Math.round(v));
 }
+function fmtPct(v) {
+  if (v == null || !Number.isFinite(v)) return "—";
+  return (v * 100).toFixed(1).replace(".", ",") + "%";
+}
 function fmtRoas(v) {
   if (v == null || !Number.isFinite(v)) return "—";
   return v.toFixed(2) + "x";
@@ -231,6 +235,9 @@ function SourceBreakdown({ sources, total }) {
               <th>% do total</th>
               <th>Transações</th>
               <th>Ticket</th>
+              <th>Criadas</th>
+              <th>Pagas</th>
+              <th>Conversão</th>
             </tr>
           </thead>
           <tbody>
@@ -243,6 +250,9 @@ function SourceBreakdown({ sources, total }) {
                 <td>
                   {fmtMoney(s.transactions > 0 ? s.revenue / s.transactions : null)}
                 </td>
+                <td>{s.created > 0 ? fmtNum(s.created) : "—"}</td>
+                <td>{s.created > 0 ? fmtNum(s.convPaid) : "—"}</td>
+                <td>{fmtPct(s.created > 0 ? s.convPaid / s.created : null)}</td>
               </tr>
             ))}
           </tbody>
@@ -278,6 +288,15 @@ function BrandBlock({ brand, color }) {
         />
         <Card label="CPA" value={fmtMoney(brand.cpa)} />
         <Card label="ROAS" value={fmtRoas(brand.roas)} />
+        <Card
+          label="Conversão"
+          value={fmtPct(brand.conversion)}
+          sub={
+            brand.created > 0
+              ? `${fmtNum(brand.convPaid)} pagas de ${fmtNum(brand.created)} criadas`
+              : "sem dados de cobranças criadas"
+          }
+        />
       </div>
     </>
   );
@@ -302,6 +321,7 @@ function enrich(series) {
     cpa: p.transactions > 0 ? p.spend / p.transactions : null,
     roas: p.spend > 0 ? p.revenue / p.spend : null,
     takeRate: p.revenue - p.spend,
+    conversion: p.created > 0 ? p.convPaid / p.created : null,
   }));
 }
 
@@ -314,6 +334,8 @@ function DayTable({ series, title }) {
   const tSpend = sum("spend");
   const tRevenue = sum("revenue");
   const tTx = sum("transactions");
+  const tCreated = sum("created");
+  const tConvPaid = sum("convPaid");
 
   return (
     <div className="table-card">
@@ -332,6 +354,8 @@ function DayTable({ series, title }) {
               <th>Ticket</th>
               <th>CPA</th>
               <th>ROAS</th>
+              <th>Criadas</th>
+              <th>Conversão</th>
             </tr>
           </thead>
           <tbody>
@@ -349,6 +373,8 @@ function DayTable({ series, title }) {
                 </td>
                 <td>{fmtMoney(r.cpa)}</td>
                 <td>{fmtRoas(r.roas)}</td>
+                <td>{r.created > 0 ? fmtNum(r.created) : "—"}</td>
+                <td>{fmtPct(r.conversion)}</td>
               </tr>
             ))}
           </tbody>
@@ -364,6 +390,8 @@ function DayTable({ series, title }) {
               <td>{fmtMoney(tTx > 0 ? tRevenue / tTx : null)}</td>
               <td>{fmtMoney(tTx > 0 ? tSpend / tTx : null)}</td>
               <td>{fmtRoas(tSpend > 0 ? tRevenue / tSpend : null)}</td>
+              <td>{tCreated > 0 ? fmtNum(tCreated) : "—"}</td>
+              <td>{fmtPct(tCreated > 0 ? tConvPaid / tCreated : null)}</td>
             </tr>
           </tfoot>
         </table>
@@ -571,6 +599,11 @@ function ChartCard({ series, title }) {
           </div>
           <div className="t-row">
             Transações: {fmtNum(points[hover.i].transactions)}
+          </div>
+          <div className="t-row">
+            Conversão: {fmtPct(points[hover.i].conversion)}
+            {points[hover.i].created > 0 &&
+              ` (${fmtNum(points[hover.i].convPaid)}/${fmtNum(points[hover.i].created)})`}
           </div>
           <div className="t-row">CPA: {fmtMoney(points[hover.i].cpa)}</div>
           <div className="t-row">ROAS: {fmtRoas(points[hover.i].roas)}</div>
