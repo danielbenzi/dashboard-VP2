@@ -8,6 +8,7 @@ const WINDSOR_BASE = "https://connectors.windsor.ai/google_ads";
 const ABACATE_V2 = "https://api.abacatepay.com/v2";
 const ABACATE_V1 = "https://api.abacatepay.com/v1";
 const STRIPE_BASE = "https://api.stripe.com/v1";
+const PUSHIN_BASE = process.env.PUSHIN_BASE || "https://api.pushinpay.com.br/api";
 
 // O Windsor guarda a resposta de CADA URL de conector por 6 HORAS. Sem pedir
 // refresh, um plano com atualização horária não adianta nada: a chamada volta
@@ -47,6 +48,22 @@ const ABACATE_PATHS = (
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
+// ---------- PushinPay ----------
+// A doc pública da PushinPay só descreve POST /pix/cashIn, GET /transaction/{id}
+// e GET /cashOut — não há endpoint de listagem documentado. O painel tem a tela
+// de transações, então o endpoint existe; como o caminho não é público, ele fica
+// em variável de ambiente. Se a sua conta usar outro caminho/nomes de parâmetro,
+// muda aqui pelo ambiente, sem tocar no código.
+const PUSHIN_LIST_PATH = process.env.PUSHIN_LIST_PATH || "/transactions";
+// nomes dos parâmetros de data aceitos pelo endpoint de listagem
+const PUSHIN_PARAM_FROM = process.env.PUSHIN_PARAM_FROM || "start_date";
+const PUSHIN_PARAM_TO = process.env.PUSHIN_PARAM_TO || "end_date";
+const PUSHIN_PAGE_LIMIT = String(
+  Math.min(100, Math.max(1, Number(process.env.PUSHIN_PAGE_LIMIT) || 50))
+);
+// A PushinPay é uma API Laravel: status vem minúsculo ('paid'), valores em centavos.
+const PUSHIN_PAID = (process.env.PUSHIN_PAID_STATUS || "paid").toLowerCase();
+
 // Cache em memória (por instância warm da função)
 const CACHE_TTL_MS = 2 * 60 * 1000;
 const memCache = new Map(); // key -> { at, payload }
@@ -225,8 +242,9 @@ async function abFetch(url, apiKey, budget) {
       const failed = !res.ok || (json && json.success === false);
       if (!failed) return { res, json, text };
       last = { res, json, text };
-      // erro de autenticação não se resolve com retry
-      if (res.status === 401 || res.status === 403) break;
+      // autenticação e rota inexistente não se resolvem com retry — insistir só
+      // gasta orçamento que as outras fontes precisam
+      if (res.status === 401 || res.status === 403 || res.status === 404) break;
     } catch (e) {
       if (e?.name === "BudgetError") break;
       const isTimeout = e?.name === "TimeoutError";
@@ -629,6 +647,108 @@ async function fetchStripeTransactions(apiKey, from, to, warnings, brandLabel, b
   return out;
 }
 
+// ---------- PushinPay (PIX) ----------
+// { amount: reais, date: 'YYYY-MM-DD' } — a API devolve centavos, igual ao Abacate.
+function normalizePushinTx(it) {
+  const cents = it.value != null ? it.value : it.amount;
+  const raw =
+    it.paid_at || it.paidAt || it.updated_at || it.created_at || it.createdAt || "";
+  let date = "";
+  if (raw) {
+    const s = String(raw);
+    // Só converte de fuso quando a string DIZ o fuso ('Z' ou ±hh:mm). Datas do
+    // Laravel sem fuso ("2026-09-01 14:23:11") já vêm no horário de Brasília;
+    // convertê-las jogaria a venda para o dia anterior.
+    const temFuso = /(Z|[+-]\d{2}:?\d{2})$/.test(s.trim());
+    const d = temFuso ? new Date(s) : null;
+    date = d && !isNaN(d) ? d.toLocaleDateString("en-CA", { timeZone: TZ }) : s.slice(0, 10);
+  }
+  return { amount: num(cents) / 100, date, source: "PushinPay" };
+}
+
+async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, budget) {
+  if (!apiKey) return [];
+
+  const out = [];
+  const seen = new Set();
+  let nextUrl = null;
+  let truncated = true;
+
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    if (budget.expired()) throw budgetError();
+
+    let url = nextUrl;
+    if (!url) {
+      const u = new URL(`${PUSHIN_BASE}${PUSHIN_LIST_PATH}`);
+      u.searchParams.set("per_page", PUSHIN_PAGE_LIMIT);
+      u.searchParams.set("page", String(page));
+      u.searchParams.set("status", PUSHIN_PAID);
+      if (from) u.searchParams.set(PUSHIN_PARAM_FROM, from);
+      if (to) u.searchParams.set(PUSHIN_PARAM_TO, to);
+      url = u.toString();
+    }
+
+    // mesmo helper do Abacate: Bearer + JSON, com retry e respeito ao orçamento
+    const { res, json, text } = await abFetch(url, apiKey, budget);
+    if (!res.ok) {
+      const err = new Error(
+        res.status === 404
+          ? `HTTP 404 em ${PUSHIN_LIST_PATH} — não existe listagem nesse caminho. ` +
+            `Confira o caminho certo no painel/doc da PushinPay e ajuste a variável ` +
+            `PUSHIN_LIST_PATH (a doc pública só descreve /pix/cashIn e /transaction/{id}).`
+          : `HTTP ${res.status} (página ${page}): ${String(text).slice(0, 200)}`
+      );
+      err.status = res.status;
+      throw err;
+    }
+
+    // aceita array puro ou paginador do Laravel ({ data: [...] })
+    const raw = Array.isArray(json) ? json : (json && (json.data || json.items)) || [];
+    let novos = 0;
+    for (const it of raw) {
+      if (String(it.status || "").toLowerCase() !== PUSHIN_PAID) continue;
+      const id = it.id || it.end_to_end_id || JSON.stringify(it);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      novos++;
+      const tx = normalizePushinTx(it);
+      // Filtra a janela AQUI também: se a API ignorar os parâmetros de data, o
+      // total continua certo — só custa mais páginas.
+      if (!inRange(tx.date, from, to)) continue;
+      out.push(tx);
+    }
+
+    const nxt = (json && (json.next_page_url || json.links?.next)) || null;
+    const cur = num(json && json.current_page);
+    const last = num(json && json.last_page);
+    const fullPage = raw.length >= Number(PUSHIN_PAGE_LIMIT);
+
+    if (novos === 0) {
+      // página repetida ou vazia — a API ignorou o cursor; parar é o certo
+      truncated = false;
+      break;
+    }
+    if (nxt) {
+      nextUrl = nxt;
+      continue;
+    }
+    if ((cur && last && cur < last) || (!cur && fullPage)) {
+      nextUrl = null; // segue pelo número da página
+      continue;
+    }
+    truncated = false;
+    break;
+  }
+
+  if (truncated) {
+    warnings.push(
+      `PushinPay (${brandLabel}): atingiu o limite de ${MAX_PAGES} páginas ` +
+        `(${out.length} transações lidas) — pode haver pagamentos não contabilizados.`
+    );
+  }
+  return out;
+}
+
 // agrega uma marca: junta gasto (Google) + receita/transações (pagamentos)
 function buildBrand(name, gadsRows, abacateTx, from, to) {
   const daily = {};
@@ -774,6 +894,26 @@ export async function GET(request) {
     // hora a hora do último dia da janela — no FIM para não deslocar os
     // índices de results usados abaixo
     settle(fetchGoogleAdsHourly(to, budget)),
+    settle(
+      fetchPushinTransactions(
+        process.env.PUSHIN_KEY_PROCESSO,
+        from,
+        to,
+        warnings,
+        "Processo",
+        budget
+      )
+    ),
+    settle(
+      fetchPushinTransactions(
+        process.env.PUSHIN_KEY_PLACA,
+        from,
+        to,
+        warnings,
+        "Placa",
+        budget
+      )
+    ),
   ]);
 
   const label = (r) =>
@@ -802,6 +942,14 @@ export async function GET(request) {
   let hourlyRows = [];
   if (results[5].status === "fulfilled") hourlyRows = results[5].value;
   else warnings.push(`Google Ads (hora a hora): ${label(results[5])}`);
+
+  // PushinPay soma às transações da marca, igual à Stripe. Falha é aviso, não
+  // erro fatal — o resto do dashboard continua de pé.
+  if (results[6].status === "fulfilled") txProcesso = txProcesso.concat(results[6].value);
+  else warnings.push(`PushinPay (Processo): ${label(results[6])}`);
+
+  if (results[7].status === "fulfilled") txPlaca = txPlaca.concat(results[7].value);
+  else warnings.push(`PushinPay (Placa): ${label(results[7])}`);
 
   const brands = [
     buildBrand(nameProcesso, gadsRows, txProcesso, from, to),
