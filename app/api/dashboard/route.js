@@ -275,6 +275,35 @@ function txDate(it) {
   return d.toLocaleDateString("en-CA", { timeZone: TZ });
 }
 
+// Converte um timestamp na data YYYY-MM-DD do fuso do dashboard. Só converte de
+// fuso quando a string DIZ o fuso ('Z' ou ±hh:mm); sem isso (formato do Laravel,
+// "2026-09-01 14:23:11") assume que já está em horário de Brasília — converter
+// jogaria a venda para o dia anterior.
+function toLocalDate(raw) {
+  if (!raw) return "";
+  const s = String(raw).trim();
+  if (!/(Z|[+-]\d{2}:?\d{2})$/.test(s)) return s.slice(0, 10);
+  const d = new Date(s);
+  return isNaN(d) ? s.slice(0, 10) : d.toLocaleDateString("en-CA", { timeZone: TZ });
+}
+
+// ---------- funil: cobranças CRIADAS x PAGAS ----------
+// O funil é contado pela data de CRIAÇÃO, dos dois lados: "das cobranças criadas
+// no dia X, quantas foram pagas". É um recorte de coorte, diferente do card
+// "Transações" (que conta pela data do PAGAMENTO). Por isso os dois números
+// podem divergir num mesmo dia — e é assim que tem que ser: cobrança criada dia
+// 30 e paga dia 2 conta no funil do dia 30 e na receita do dia 2.
+function bumpFunnel(funnel, source, createdRaw, paid) {
+  if (!funnel) return;
+  const date = toLocalDate(createdRaw);
+  if (!date) return;
+  const k = `${source}|${date}`;
+  const cur = funnel.get(k) || { source, date, created: 0, paid: 0 };
+  cur.created += 1;
+  if (paid) cur.paid += 1;
+  funnel.set(k, cur);
+}
+
 // { amount: reais, date: 'YYYY-MM-DD' } — a API devolve centavos
 function normalizeTx(it) {
   const cents = it.paidAmount != null ? it.paidAmount : it.amount;
@@ -362,7 +391,7 @@ async function listV2(path, paidStatus, apiKey, from, to, budget, onTruncate, us
 
 // v1: /billing/list devolve TODAS as cobranças numa resposta só — a
 // especificação v1 não aceita nenhum parâmetro de consulta. Filtramos PAID aqui.
-async function listV1Billings(apiKey, budget) {
+async function listV1Billings(apiKey, budget, funnel) {
   const { res, json, text } = await abFetch(`${ABACATE_V1}/billing/list`, apiKey, budget);
   if (!res.ok || (json && json.success === false)) {
     const err = new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
@@ -371,6 +400,15 @@ async function listV1Billings(apiKey, budget) {
     throw err;
   }
   const items = (json && json.data) || [];
+  // Esta chamada já traz TODAS as cobranças, pagas ou não — é de graça registrar
+  // o funil aqui antes de descartar as não pagas.
+  for (const b of items) {
+    const st = String(b.status).toUpperCase();
+    // PENDING/PAID/EXPIRED/CANCELLED contam como criadas; REFUNDED foi paga e
+    // depois estornada, então não é uma cobrança "não convertida".
+    if (st === "REFUNDED") continue;
+    bumpFunnel(funnel, "Abacate", b.createdAt || b.created_at, st === "PAID");
+  }
   return items.filter((b) => String(b.status).toUpperCase() === "PAID");
 }
 
@@ -420,7 +458,7 @@ async function fetchAbacateRevenueSummary(apiKey, from, to, budget, onMismatch) 
 }
 
 // Listagem detalhada v2 — último recurso.
-async function fetchAbacateByListing(apiKey, from, to, warnings, brandLabel, budget) {
+async function fetchAbacateByListing(apiKey, from, to, warnings, brandLabel, budget, funnel) {
   if (!apiKey) return [];
 
   try {
@@ -492,7 +530,7 @@ async function fetchAbacateByListing(apiKey, from, to, warnings, brandLabel, bud
     const isVersionMismatch =
       /version mismatch/i.test(e.body || e.message || "") || e.status === 401;
     if (!isVersionMismatch) throw e;
-    const billings = await listV1Billings(apiKey, budget);
+    const billings = await listV1Billings(apiKey, budget, funnel);
     return billings.map(normalizeTx);
   }
 }
@@ -502,12 +540,12 @@ async function fetchAbacateByListing(apiKey, from, to, warnings, brandLabel, bud
 //                           e a janela aqui, então a semântica é auditável.
 //   /v2/public-mrr/revenue  total já agregado pelo Abacate para o período.
 // Usamos o v1 e conferimos contra o resumo.
-async function fetchAbacateTransactions(apiKey, from, to, warnings, brandLabel, budget) {
+async function fetchAbacateTransactions(apiKey, from, to, warnings, brandLabel, budget, funnel) {
   if (!apiKey) return [];
 
   const settle = (p) => p.then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
   const [v1r, sumr] = await Promise.all([
-    settle(listV1Billings(apiKey, budget)),
+    settle(listV1Billings(apiKey, budget, funnel)),
     settle(
       fetchAbacateRevenueSummary(apiKey, from, to, budget, (msg) =>
         warnings.push(`Abacate (${brandLabel}/resumo): ${msg}`)
@@ -565,7 +603,7 @@ async function fetchAbacateTransactions(apiKey, from, to, warnings, brandLabel, 
       `(${sumr.ok ? "vazio" : sumr.e?.message || sumr.e}) não trouxeram dados — ` +
       `tentando a listagem paginada.`
   );
-  return fetchAbacateByListing(apiKey, from, to, warnings, brandLabel, budget);
+  return fetchAbacateByListing(apiKey, from, to, warnings, brandLabel, budget, funnel);
 }
 
 // ---------- Stripe (pagamentos com cartão) ----------
@@ -575,7 +613,7 @@ function brtToUnix(dateStr, endOfDay) {
   return Math.floor(new Date(`${dateStr}T${t}-03:00`).getTime() / 1000);
 }
 
-async function fetchStripeTransactions(apiKey, from, to, warnings, brandLabel, budget) {
+async function fetchStripeTransactions(apiKey, from, to, warnings, brandLabel, budget, funnel) {
   if (!apiKey) return [];
 
   const out = [];
@@ -612,6 +650,16 @@ async function fetchStripeTransactions(apiKey, from, to, warnings, brandLabel, b
 
     const raw = (json && json.data) || [];
     for (const ch of raw) {
+      // Funil do cartão: /charges devolve também as recusadas, então "criadas"
+      // aqui são as TENTATIVAS de cobrança e "pagas" as aprovadas — é taxa de
+      // aprovação, não abandono de PIX. Uma aprovada e depois estornada conta
+      // como convertida (ela converteu; o estorno só abate a receita).
+      bumpFunnel(
+        funnel,
+        "Stripe",
+        new Date(num(ch.created) * 1000).toISOString(),
+        ch.status === "succeeded" && !!ch.paid
+      );
       // só cobrança efetivamente capturada; estorno abate do valor
       if (ch.status !== "succeeded" || !ch.paid) continue;
       const gross = num(ch.amount_captured != null ? ch.amount_captured : ch.amount);
@@ -653,20 +701,10 @@ function normalizePushinTx(it) {
   const cents = it.value != null ? it.value : it.amount;
   const raw =
     it.paid_at || it.paidAt || it.updated_at || it.created_at || it.createdAt || "";
-  let date = "";
-  if (raw) {
-    const s = String(raw);
-    // Só converte de fuso quando a string DIZ o fuso ('Z' ou ±hh:mm). Datas do
-    // Laravel sem fuso ("2026-09-01 14:23:11") já vêm no horário de Brasília;
-    // convertê-las jogaria a venda para o dia anterior.
-    const temFuso = /(Z|[+-]\d{2}:?\d{2})$/.test(s.trim());
-    const d = temFuso ? new Date(s) : null;
-    date = d && !isNaN(d) ? d.toLocaleDateString("en-CA", { timeZone: TZ }) : s.slice(0, 10);
-  }
-  return { amount: num(cents) / 100, date, source: "PushinPay" };
+  return { amount: num(cents) / 100, date: toLocalDate(raw), source: "PushinPay" };
 }
 
-async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, budget) {
+async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, budget, funnel) {
   if (!apiKey) return [];
 
   const out = [];
@@ -682,7 +720,9 @@ async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, b
       const u = new URL(`${PUSHIN_BASE}${PUSHIN_LIST_PATH}`);
       u.searchParams.set("per_page", PUSHIN_PAGE_LIMIT);
       u.searchParams.set("page", String(page));
-      u.searchParams.set("status", PUSHIN_PAID);
+      // Sem filtro de status de propósito: a MESMA listagem alimenta a receita
+      // (só as pagas) e o funil de conversão (criadas x pagas). Filtrar no
+      // servidor daria a receita certa e um funil sempre 100%.
       if (from) u.searchParams.set(PUSHIN_PARAM_FROM, from);
       if (to) u.searchParams.set(PUSHIN_PARAM_TO, to);
       url = u.toString();
@@ -706,11 +746,15 @@ async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, b
     const raw = Array.isArray(json) ? json : (json && (json.data || json.items)) || [];
     let novos = 0;
     for (const it of raw) {
-      if (String(it.status || "").toLowerCase() !== PUSHIN_PAID) continue;
       const id = it.id || it.end_to_end_id || JSON.stringify(it);
       if (seen.has(id)) continue;
       seen.add(id);
       novos++;
+
+      const pago = String(it.status || "").toLowerCase() === PUSHIN_PAID;
+      bumpFunnel(funnel, "PushinPay", it.created_at || it.createdAt, pago);
+
+      if (!pago) continue;
       const tx = normalizePushinTx(it);
       // Filtra a janela AQUI também: se a API ignorar os parâmetros de data, o
       // total continua certo — só custa mais páginas.
@@ -750,8 +794,13 @@ async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, b
 }
 
 // agrega uma marca: junta gasto (Google) + receita/transações (pagamentos)
-function buildBrand(name, gadsRows, abacateTx, from, to) {
+function buildBrand(name, gadsRows, abacateTx, funnel, from, to) {
   const daily = {};
+  const dayOf = (d) => {
+    if (!daily[d])
+      daily[d] = { date: d, spend: 0, revenue: 0, transactions: 0, created: 0, convPaid: 0 };
+    return daily[d];
+  };
   let spend = 0,
     clicks = 0,
     impressions = 0,
@@ -768,8 +817,7 @@ function buildBrand(name, gadsRows, abacateTx, from, to) {
     impressions += num(r.impressions);
     gadsConversions += num(r.conversions);
     gadsConvValue += num(r.conversion_value);
-    if (!daily[d]) daily[d] = { date: d, spend: 0, revenue: 0, transactions: 0 };
-    daily[d].spend += s;
+    dayOf(d).spend += s;
   }
 
   let revenue = 0,
@@ -777,6 +825,11 @@ function buildBrand(name, gadsRows, abacateTx, from, to) {
   // quanto cada fonte trouxe: revela se um número baixo é venda fraca ou
   // fonte faltando/desligada
   const bySource = {};
+  const srcOf = (s) => {
+    if (!bySource[s])
+      bySource[s] = { source: s, revenue: 0, transactions: 0, created: 0, convPaid: 0 };
+    return bySource[s];
+  };
   for (const t of abacateTx) {
     if (!inRange(t.date, from, to)) continue;
     // `count` existe quando a linha é um agregado diário (resumo do Abacate);
@@ -784,15 +837,29 @@ function buildBrand(name, gadsRows, abacateTx, from, to) {
     const n = num(t.count) || 1;
     revenue += t.amount;
     transactions += n;
-    const s = t.source || "desconhecido";
-    if (!bySource[s]) bySource[s] = { source: s, revenue: 0, transactions: 0 };
-    bySource[s].revenue += t.amount;
-    bySource[s].transactions += n;
-    if (!daily[t.date])
-      daily[t.date] = { date: t.date, spend: 0, revenue: 0, transactions: 0 };
-    daily[t.date].revenue += t.amount;
-    daily[t.date].transactions += n;
+    const src = srcOf(t.source || "desconhecido");
+    src.revenue += t.amount;
+    src.transactions += n;
+    const day = dayOf(t.date);
+    day.revenue += t.amount;
+    day.transactions += n;
   }
+
+  // funil de conversão — contado pela data de CRIAÇÃO da cobrança
+  let created = 0;
+  let convPaid = 0;
+  for (const f of funnel || []) {
+    if (!inRange(f.date, from, to)) continue;
+    created += f.created;
+    convPaid += f.paid;
+    const src = srcOf(f.source);
+    src.created += f.created;
+    src.convPaid += f.paid;
+    const day = dayOf(f.date);
+    day.created += f.created;
+    day.convPaid += f.paid;
+  }
+
   const sources = Object.values(bySource).sort((a, b) => b.revenue - a.revenue);
 
   const series = Object.values(daily).sort((a, b) => (a.date < b.date ? -1 : 1));
@@ -801,11 +868,18 @@ function buildBrand(name, gadsRows, abacateTx, from, to) {
   const roas = spend > 0 ? revenue / spend : null;
   const ticket = transactions > 0 ? revenue / transactions : null;
 
+  // null (e não 0) quando nenhuma fonte soube informar as criadas: o card mostra
+  // "—" em vez de fingir 0% de conversão.
+  const conversion = created > 0 ? convPaid / created : null;
+
   return {
     name,
     spend,
     revenue,
     transactions,
+    created,
+    convPaid,
+    conversion,
     cpa,
     roas,
     ticket,
@@ -844,6 +918,11 @@ export async function GET(request) {
 
   const budget = makeBudget(BUDGET_MS);
 
+  // Funil por marca: Map 'fonte|data' -> { source, date, created, paid }.
+  // Cada fetcher registra aqui o que já viu, sem chamada extra a API nenhuma.
+  const funnelProcesso = new Map();
+  const funnelPlaca = new Map();
+
   const settle = (p) =>
     p.then(
       (value) => ({ status: "fulfilled", value }),
@@ -858,7 +937,8 @@ export async function GET(request) {
         to,
         warnings,
         "Processo",
-        budget
+        budget,
+        funnelProcesso
       )
     ),
     settle(
@@ -868,7 +948,8 @@ export async function GET(request) {
         to,
         warnings,
         "Placa",
-        budget
+        budget,
+        funnelPlaca
       )
     ),
     settle(
@@ -878,7 +959,8 @@ export async function GET(request) {
         to,
         warnings,
         "Processo",
-        budget
+        budget,
+        funnelProcesso
       )
     ),
     settle(
@@ -888,7 +970,8 @@ export async function GET(request) {
         to,
         warnings,
         "Placa",
-        budget
+        budget,
+        funnelPlaca
       )
     ),
     // hora a hora do último dia da janela — no FIM para não deslocar os
@@ -901,7 +984,8 @@ export async function GET(request) {
         to,
         warnings,
         "Processo",
-        budget
+        budget,
+        funnelProcesso
       )
     ),
     settle(
@@ -911,7 +995,8 @@ export async function GET(request) {
         to,
         warnings,
         "Placa",
-        budget
+        budget,
+        funnelPlaca
       )
     ),
   ]);
@@ -952,8 +1037,8 @@ export async function GET(request) {
   else warnings.push(`PushinPay (Placa): ${label(results[7])}`);
 
   const brands = [
-    buildBrand(nameProcesso, gadsRows, txProcesso, from, to),
-    buildBrand(namePlaca, gadsRows, txPlaca, from, to),
+    buildBrand(nameProcesso, gadsRows, txProcesso, [...funnelProcesso.values()], from, to),
+    buildBrand(namePlaca, gadsRows, txPlaca, [...funnelPlaca.values()], from, to),
   ];
 
   // total consolidado
@@ -962,16 +1047,33 @@ export async function GET(request) {
   for (const br of brands) {
     for (const s of br.sources || []) {
       if (!mergedSources[s.source])
-        mergedSources[s.source] = { source: s.source, revenue: 0, transactions: 0 };
+        mergedSources[s.source] = {
+          source: s.source,
+          revenue: 0,
+          transactions: 0,
+          created: 0,
+          convPaid: 0,
+        };
       mergedSources[s.source].revenue += s.revenue;
       mergedSources[s.source].transactions += s.transactions;
+      mergedSources[s.source].created += s.created || 0;
+      mergedSources[s.source].convPaid += s.convPaid || 0;
     }
     for (const p of br.series) {
       if (!merged[p.date])
-        merged[p.date] = { date: p.date, spend: 0, revenue: 0, transactions: 0 };
+        merged[p.date] = {
+          date: p.date,
+          spend: 0,
+          revenue: 0,
+          transactions: 0,
+          created: 0,
+          convPaid: 0,
+        };
       merged[p.date].spend += p.spend;
       merged[p.date].revenue += p.revenue;
       merged[p.date].transactions += p.transactions;
+      merged[p.date].created += p.created || 0;
+      merged[p.date].convPaid += p.convPaid || 0;
     }
   }
   const totalSpend = brands.reduce((a, b) => a + b.spend, 0);
@@ -979,12 +1081,17 @@ export async function GET(request) {
   const totalTx = brands.reduce((a, b) => a + b.transactions, 0);
   const totalGadsConv = brands.reduce((a, b) => a + (b.gadsConversions || 0), 0);
   const totalGadsValue = brands.reduce((a, b) => a + (b.gadsConvValue || 0), 0);
+  const totalCreated = brands.reduce((a, b) => a + (b.created || 0), 0);
+  const totalConvPaid = brands.reduce((a, b) => a + (b.convPaid || 0), 0);
 
   const total = {
     name: "Total",
     spend: totalSpend,
     revenue: totalRevenue,
     transactions: totalTx,
+    created: totalCreated,
+    convPaid: totalConvPaid,
+    conversion: totalCreated > 0 ? totalConvPaid / totalCreated : null,
     cpa: totalTx > 0 ? totalSpend / totalTx : null,
     roas: totalSpend > 0 ? totalRevenue / totalSpend : null,
     ticket: totalTx > 0 ? totalRevenue / totalTx : null,
