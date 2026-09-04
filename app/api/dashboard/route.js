@@ -58,9 +58,15 @@ const PUSHIN_LIST_PATH = process.env.PUSHIN_LIST_PATH || "/transactions";
 // nomes dos parâmetros de data aceitos pelo endpoint de listagem
 const PUSHIN_PARAM_FROM = process.env.PUSHIN_PARAM_FROM || "start_date";
 const PUSHIN_PARAM_TO = process.env.PUSHIN_PARAM_TO || "end_date";
+// 100 (o teto da maioria dessas APIs) em vez de 50: sem o filtro de status a
+// listagem traz também os PIX não pagos, então página pequena estoura o teto de
+// páginas antes de terminar o mês.
 const PUSHIN_PAGE_LIMIT = String(
-  Math.min(100, Math.max(1, Number(process.env.PUSHIN_PAGE_LIMIT) || 50))
+  Math.min(100, Math.max(1, Number(process.env.PUSHIN_PAGE_LIMIT) || 100))
 );
+// Teto de páginas SÓ da PushinPay (o MAX_PAGES geral é do fallback do Abacate).
+// Quem para de verdade é o orçamento da rota; isto é rede de segurança.
+const PUSHIN_MAX_PAGES = Math.max(1, Number(process.env.PUSHIN_MAX_PAGES) || 300);
 // A PushinPay é uma API Laravel: status vem minúsculo ('paid'), valores em centavos.
 const PUSHIN_PAID = (process.env.PUSHIN_PAID_STATUS || "paid").toLowerCase();
 
@@ -711,8 +717,9 @@ async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, b
   const seen = new Set();
   let nextUrl = null;
   let truncated = true;
+  let lidos = 0; // registros vistos, pagos ou não — o out só guarda os pagos
 
-  for (let page = 1; page <= MAX_PAGES; page++) {
+  for (let page = 1; page <= PUSHIN_MAX_PAGES; page++) {
     if (budget.expired()) throw budgetError();
 
     let url = nextUrl;
@@ -745,6 +752,7 @@ async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, b
     // aceita array puro ou paginador do Laravel ({ data: [...] })
     const raw = Array.isArray(json) ? json : (json && (json.data || json.items)) || [];
     let novos = 0;
+    lidos += raw.length;
     for (const it of raw) {
       const id = it.id || it.end_to_end_id || JSON.stringify(it);
       if (seen.has(id)) continue;
@@ -786,8 +794,10 @@ async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, b
 
   if (truncated) {
     warnings.push(
-      `PushinPay (${brandLabel}): atingiu o limite de ${MAX_PAGES} páginas ` +
-        `(${out.length} transações lidas) — pode haver pagamentos não contabilizados.`
+      `PushinPay (${brandLabel}): parou no limite de ${PUSHIN_MAX_PAGES} páginas — ` +
+        `${lidos} registros lidos, ${out.length} pagos no período. Pode haver ` +
+        `pagamentos não contabilizados. Rode /api/dashboard?debug=pushin para ver ` +
+        `se os filtros de data e de status estão sendo respeitados pela API.`
     );
   }
   return out;
@@ -892,11 +902,113 @@ function buildBrand(name, gadsRows, abacateTx, funnel, from, to) {
   };
 }
 
+// ---------- diagnóstico da listagem da PushinPay ----------
+// A API não tem doc pública de listagem. Em vez de chutar de novo, este endpoint
+// pergunta para a própria API o que ela respeita: 4 chamadas pequenas cujo
+// resultado diz se `per_page`, o filtro de data e o de status funcionam.
+async function debugPushin(apiKey, from, to, budget) {
+  const call = async (params) => {
+    const u = new URL(`${PUSHIN_BASE}${PUSHIN_LIST_PATH}`);
+    for (const [k, v] of Object.entries(params)) u.searchParams.set(k, String(v));
+    const { res, json, text } = await abFetch(u.toString(), apiKey, budget);
+    if (!res.ok) return { status: res.status, erro: String(text).slice(0, 200) };
+    const arr = Array.isArray(json) ? json : (json && (json.data || json.items)) || [];
+    const datas = arr
+      .map((r) => toLocalDate(r.created_at || r.createdAt))
+      .filter(Boolean)
+      .sort();
+    return {
+      status: res.status,
+      respostaEhArrayPuro: Array.isArray(json),
+      chavesDaResposta: Array.isArray(json) ? null : Object.keys(json || {}),
+      paginacao: {
+        total: json?.total ?? null,
+        per_page: json?.per_page ?? null,
+        current_page: json?.current_page ?? null,
+        last_page: json?.last_page ?? null,
+        next_page_url: json?.next_page_url ? "presente" : null,
+      },
+      registrosNaPagina: arr.length,
+      camposDoRegistro: arr[0] ? Object.keys(arr[0]) : null,
+      statusVistos: [...new Set(arr.map((r) => String(r.status || "").toLowerCase()))],
+      criadoEmMin: datas[0] || null,
+      criadoEmMax: datas[datas.length - 1] || null,
+    };
+  };
+
+  const comData = { per_page: PUSHIN_PAGE_LIMIT, page: 1, [PUSHIN_PARAM_FROM]: from, [PUSHIN_PARAM_TO]: to };
+  const [A, B, C, D] = await Promise.all([
+    call(comData),
+    call({ ...comData, status: PUSHIN_PAID }),
+    call({ per_page: 1, page: 1, [PUSHIN_PARAM_FROM]: from, [PUSHIN_PARAM_TO]: to }),
+    call({ per_page: 1, page: 1 }),
+  ]);
+
+  const totalJanela = C.paginacao?.total ?? null;
+  const totalGeral = D.paginacao?.total ?? null;
+
+  return {
+    caminho: PUSHIN_LIST_PATH,
+    periodo: { from, to },
+    A_pagina_cheia_na_janela: A,
+    B_mesma_coisa_pedindo_status_paid: B,
+    C_contagem_da_janela: C,
+    D_contagem_sem_filtro_de_data: D,
+    conclusoes: {
+      per_page_respeitado:
+        A.registrosNaPagina == null
+          ? null
+          : A.paginacao?.per_page != null
+          ? String(A.paginacao.per_page) === String(PUSHIN_PAGE_LIMIT)
+            ? "sim"
+            : `NÃO — pedi ${PUSHIN_PAGE_LIMIT}, a API usou ${A.paginacao.per_page}`
+          : A.registrosNaPagina > 50
+          ? "provavelmente sim"
+          : `inconclusivo (voltaram ${A.registrosNaPagina} registros)`,
+      filtro_de_data_funciona:
+        totalJanela != null && totalGeral != null
+          ? totalJanela < totalGeral
+            ? `sim (${totalJanela} na janela x ${totalGeral} no total)`
+            : "NÃO — mesma contagem com e sem filtro de data"
+          : A.criadoEmMin && (A.criadoEmMin < from || A.criadoEmMax > to)
+          ? `NÃO — a página trouxe datas de ${A.criadoEmMin} a ${A.criadoEmMax}, fora da janela`
+          : "não dá para saber (a API não devolve 'total')",
+      filtro_de_status_funciona:
+        !B.statusVistos
+          ? null
+          : B.statusVistos.length === 1 && B.statusVistos[0] === PUSHIN_PAID
+          ? "sim"
+          : `NÃO — pedindo '${PUSHIN_PAID}' voltaram: ${B.statusVistos.join(", ")}`,
+      quantas_paginas_para_a_janela:
+        totalJanela != null
+          ? Math.ceil(totalJanela / Number(PUSHIN_PAGE_LIMIT))
+          : "não dá para saber sem 'total'",
+    },
+  };
+}
+
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
   const from = searchParams.get("from") || firstOfMonthISO();
   const to = searchParams.get("to") || todayISO();
   const force = searchParams.get("refresh") === "1";
+
+  // /api/dashboard?debug=pushin — diagnóstico, não devolve dado de venda
+  if (searchParams.get("debug") === "pushin") {
+    const dbg = makeBudget(20000);
+    const run = (k) =>
+      k
+        ? debugPushin(k, from, to, dbg).catch((e) => ({ erro: String(e?.message || e) }))
+        : Promise.resolve({ erro: "chave não configurada" });
+    const [proc, placa] = await Promise.all([
+      run(process.env.PUSHIN_KEY_PROCESSO),
+      run(process.env.PUSHIN_KEY_PLACA),
+    ]);
+    return NextResponse.json(
+      { Processo: proc, Placa: placa },
+      { headers: { "Cache-Control": "no-store" } }
+    );
+  }
 
   const cacheKey = `${from}:${to}`;
   const hit = memCache.get(cacheKey);
