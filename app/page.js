@@ -199,9 +199,106 @@ export default function Page() {
             color="var(--placa)"
             title={data.brands[1].name}
           />
+          <RepeatSection />
         </>
       )}
     </div>
+  );
+}
+
+// Recompra por e-mail — vem do Postgres (view vw_transactions_paid), não das
+// APIs de pagamento. Carrega em rota separada (/api/repeat) para não segurar o
+// resto da tela nem disputar o orçamento do /api/dashboard.
+function RepeatSection() {
+  const [d, setD] = useState(null);
+  const [err, setErr] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let vivo = true;
+    fetch("/api/repeat", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((j) => {
+        if (!vivo) return;
+        if (j.erro) setErr(j.erro);
+        else setD(j);
+      })
+      .catch((e) => vivo && setErr(e.message))
+      .finally(() => vivo && setLoading(false));
+    return () => {
+      vivo = false;
+    };
+  }, []);
+
+  return (
+    <>
+      <div className="section-title">
+        <span className="dot" style={{ background: "var(--amber)" }} />
+        Recompra por e-mail
+      </div>
+
+      {loading && <div className="table-card loading">Consultando o banco…</div>}
+
+      {err && (
+        <div className="banner">
+          Recompra indisponível: {err}
+        </div>
+      )}
+
+      {d && (
+        <div className="table-card">
+          <div className="legend" style={{ display: "block", lineHeight: 1.5 }}>
+            <strong style={{ color: "var(--text)" }}>
+              De cada compra, quantas voltaram em até N dias
+            </strong>
+            <div style={{ marginTop: 4 }}>
+              {fmtNum(d.totalCompras)} compras de {fmtNum(d.totalEmails)} e-mails
+              nos últimos {d.lookbackDias} dias. Cada compra é uma âncora: a
+              pergunta é se aquele e-mail comprou de novo dentro da janela.
+            </div>
+            <div style={{ marginTop: 4 }}>
+              Compras recentes demais para terem completado a janela ficam de
+              fora da contagem — por isso "âncoras" cai nas janelas longas. Sem
+              isso, 90 dias apareceria menor do que é.
+            </div>
+          </div>
+          <div className="table-scroll">
+            <table className="day-table">
+              <thead>
+                <tr>
+                  <th>Janela</th>
+                  <th>Âncoras</th>
+                  <th>Com recompra</th>
+                  <th>Taxa</th>
+                  <th></th>
+                  <th>Compras por e-mail</th>
+                </tr>
+              </thead>
+              <tbody>
+                {d.janelas.map((j) => (
+                  <tr key={j.dias}>
+                    <td>{j.dias} dias</td>
+                    <td>{fmtNum(j.ancoras)}</td>
+                    <td>{fmtNum(j.comRecompra)}</td>
+                    <td>{fmtPct(j.taxa)}</td>
+                    <td style={{ width: "34%" }}>
+                      <span className="bar">
+                        <i style={{ width: `${Math.min(100, (j.taxa || 0) * 100)}%` }} />
+                      </span>
+                    </td>
+                    <td>
+                      {j.comprasPorEmail == null
+                        ? "—"
+                        : j.comprasPorEmail.toFixed(2).replace(".", ",")}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 
