@@ -261,6 +261,21 @@ function RepeatSection() {
               fora da contagem — por isso "âncoras" cai nas janelas longas. Sem
               isso, 90 dias apareceria menor do que é.
             </div>
+            <div style={{ marginTop: 4 }}>
+              <strong style={{ color: "var(--amber)" }}>
+                As linhas não se comparam entre si.
+              </strong>{" "}
+              Cada janela usa um conjunto de âncoras diferente (olhe a coluna
+              Âncoras): a de 90 dias só enxerga compras de 90+ dias atrás, que
+              são outra safra de cliente. Compare cada linha com ela mesma ao
+              longo do tempo, não uma com a outra.
+            </div>
+            {d.minGapMinutos > 0 && (
+              <div style={{ marginTop: 4 }}>
+                Ignorando recompras em menos de {d.minGapMinutos} min — upsell e
+                order bump da mesma sessão não contam.
+              </div>
+            )}
           </div>
           <div className="table-scroll">
             <table className="day-table">
@@ -296,6 +311,56 @@ function RepeatSection() {
               </tbody>
             </table>
           </div>
+
+          {d.quandoVoltam?.total > 0 && (
+            <>
+              <div
+                className="legend"
+                style={{ display: "block", lineHeight: 1.5, marginTop: 22 }}
+              >
+                <strong style={{ color: "var(--text)" }}>
+                  Quando acontece a próxima compra
+                </strong>
+                <div style={{ marginTop: 4 }}>
+                  Das {fmtNum(d.quandoVoltam.total)} compras que tiveram uma
+                  seguinte, quanto tempo passou até ela. Os dois primeiros baldes
+                  são upsell e order bump da mesma sessão, não alguém voltando —
+                  é o tamanho deles que diz se a taxa lá de cima está inflada.
+                </div>
+              </div>
+              <div className="table-scroll">
+                <table className="day-table">
+                  <thead>
+                    <tr>
+                      <th>Intervalo até a próxima</th>
+                      <th>Compras</th>
+                      <th>Fatia</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {d.quandoVoltam.baldes.map((b, i) => (
+                      <tr key={b.rotulo}>
+                        <td>{b.rotulo}</td>
+                        <td>{fmtNum(b.n)}</td>
+                        <td>{fmtPct(b.fatia)}</td>
+                        <td style={{ width: "34%" }}>
+                          <span className="bar">
+                            <i
+                              style={{
+                                width: `${Math.min(100, (b.fatia || 0) * 100)}%`,
+                                background: i < 2 ? "var(--red)" : "var(--amber)",
+                              }}
+                            />
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
         </div>
       )}
     </>
