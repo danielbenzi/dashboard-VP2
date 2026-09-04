@@ -87,6 +87,16 @@ const REPEAT_LOOKBACK_DIAS = Math.max(
   1,
   Number(process.env.REPEAT_LOOKBACK_DAYS) || 365
 );
+// Intervalo MÍNIMO entre duas compras para a segunda contar como recompra.
+// O fluxo pós-pagamento do VP (upsell, order bump, reload, retry) gera uma
+// transação NOVA com o mesmo e-mail minutos depois da primeira — isso é a mesma
+// venda, não alguém voltando. Padrão 0 = conta tudo, para o número não mudar
+// sem você mandar. Suba para 60 (1h) ou 1440 (24h) depois de olhar a
+// distribuição de "quando acontece a próxima compra".
+const REPEAT_MIN_GAP_MIN = Math.max(
+  0,
+  Number(process.env.REPEAT_MIN_GAP_MINUTES) || 0
+);
 const REPEAT_CACHE_TTL_MS = 10 * 60 * 1000;
 const repeatCache = new Map(); // lookback -> { at, payload }
 
@@ -1102,6 +1112,7 @@ pares AS (
   FROM base a
   JOIN base b
     ON b.email = a.email
+   AND b.ts >= a.ts + make_interval(mins => $2::int)
    AND b.ts > a.ts
    AND b.ts <= a.ts + interval '${maiorJanela} days'
 ),
@@ -1112,21 +1123,73 @@ ${contagens}
   FROM base a
   LEFT JOIN pares p ON p.rid = a.rid
   GROUP BY a.rid, a.ts
+),
+-- Quando acontece a PRÓXIMA compra (a primeira depois da âncora). É isto que
+-- mostra quanto do "recomprou" é upsell/order bump da mesma sessão e quanto é
+-- gente voltando dias depois. Só âncoras que já completaram a maior janela,
+-- para a distribuição não ficar truncada.
+proxima AS (
+  SELECT p.rid, min(p.gap) AS gap
+  FROM pares p
+  JOIN base b ON b.rid = p.rid
+  WHERE b.ts + interval '${maiorJanela} days' <= (SELECT max_ts FROM lim)
+  GROUP BY p.rid
+),
+dist AS (
+  SELECT
+    count(*) FILTER (WHERE gap * 1440 < 15) AS d_15min,
+    count(*) FILTER (WHERE gap * 1440 >= 15 AND gap * 24 < 1) AS d_1h,
+    count(*) FILTER (WHERE gap * 24 >= 1 AND gap * 24 < 6) AS d_6h,
+    count(*) FILTER (WHERE gap * 24 >= 6 AND gap < 1) AS d_24h,
+    count(*) FILTER (WHERE gap >= 1 AND gap < 7) AS d_7d,
+    count(*) FILTER (WHERE gap >= 7 AND gap < 30) AS d_30d,
+    count(*) FILTER (WHERE gap >= 30) AS d_mais,
+    count(*) AS d_total
+  FROM proxima
 )
 SELECT
   (SELECT max_ts FROM lim) AS max_ts,
   (SELECT count(*) FROM base) AS total_compras,
   (SELECT count(DISTINCT email) FROM base) AS total_emails,
+  (SELECT d_15min FROM dist) AS d_15min,
+  (SELECT d_1h FROM dist) AS d_1h,
+  (SELECT d_6h FROM dist) AS d_6h,
+  (SELECT d_24h FROM dist) AS d_24h,
+  (SELECT d_7d FROM dist) AS d_7d,
+  (SELECT d_30d FROM dist) AS d_30d,
+  (SELECT d_mais FROM dist) AS d_mais,
+  (SELECT d_total FROM dist) AS d_total,
 ${agregados}
 FROM por_ancora;`;
 }
 
-function montaRepeatPayload(row, janelas, lookbackDias, colunas) {
+function montaRepeatPayload(row, janelas, lookbackDias, colunas, minGapMin) {
   const n = (v) => (v == null ? 0 : Number(v));
+  const distTotal = n(row.d_total);
+  const balde = (rotulo, v) => ({
+    rotulo,
+    n: n(v),
+    fatia: distTotal > 0 ? n(v) / distTotal : null,
+  });
   return {
     view: REPEAT_VIEW,
     colunas,
     lookbackDias,
+    minGapMinutos: minGapMin,
+    // Distribuição do intervalo até a PRÓXIMA compra. Os dois primeiros baldes
+    // são, quase certamente, upsell/order bump da mesma sessão.
+    quandoVoltam: {
+      total: distTotal,
+      baldes: [
+        balde("menos de 15 min", row.d_15min),
+        balde("15 min a 1 h", row.d_1h),
+        balde("1 h a 6 h", row.d_6h),
+        balde("6 h a 24 h", row.d_24h),
+        balde("1 a 7 dias", row.d_7d),
+        balde("7 a 30 dias", row.d_30d),
+        balde("mais de 30 dias", row.d_mais),
+      ],
+    },
     ultimaCompra: row.max_ts || null,
     totalCompras: n(row.total_compras),
     totalEmails: n(row.total_emails),
@@ -1192,9 +1255,15 @@ async function lerColunas(client) {
 async function handleRepeat(searchParams) {
   const debug = searchParams.get("debug") === "1";
   const lookback = Math.max(1, Number(searchParams.get("dias")) || REPEAT_LOOKBACK_DIAS);
+  // ?minGap=60 ignora recompras em menos de 60 min (upsell da mesma sessão)
+  const minGapParam = searchParams.get("minGap");
+  const minGap = Math.max(
+    0,
+    minGapParam != null ? Number(minGapParam) || 0 : REPEAT_MIN_GAP_MIN
+  );
   const force = searchParams.get("refresh") === "1";
 
-  const chave = String(lookback);
+  const chave = `${lookback}:${minGap}`;
   const hit = repeatCache.get(chave);
   if (!debug && !force && hit && Date.now() - hit.at < REPEAT_CACHE_TTL_MS) {
     return NextResponse.json({ ...hit.payload, cached: true });
@@ -1230,12 +1299,15 @@ async function handleRepeat(searchParams) {
 
       const { rows } = await client.query(
         buildRepeatSql(REPEAT_JANELAS, REPEAT_VIEW, email, data),
-        [lookback]
+        [lookback, minGap]
       );
-      return montaRepeatPayload(rows[0] || {}, REPEAT_JANELAS, lookback, {
-        email,
-        data,
-      });
+      return montaRepeatPayload(
+        rows[0] || {},
+        REPEAT_JANELAS,
+        lookback,
+        { email, data },
+        minGap
+      );
     });
 
     if (!debug) repeatCache.set(chave, { at: Date.now(), payload });
