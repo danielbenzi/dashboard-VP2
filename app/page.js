@@ -207,8 +207,8 @@ export default function Page() {
 }
 
 // Recompra por e-mail — vem do Postgres (view vw_transactions_paid), não das
-// APIs de pagamento. Carrega em rota separada (/api/repeat) para não segurar o
-// resto da tela nem disputar o orçamento do /api/dashboard.
+// APIs de pagamento. Mesma rota do dashboard, ramo ?repeat=1, mas buscada
+// separadamente para não segurar o resto da tela.
 function RepeatSection() {
   const [d, setD] = useState(null);
   const [err, setErr] = useState(null);
@@ -216,7 +216,7 @@ function RepeatSection() {
 
   useEffect(() => {
     let vivo = true;
-    fetch("/api/repeat", { cache: "no-store" })
+    fetch("/api/dashboard?repeat=1", { cache: "no-store" })
       .then((r) => r.json())
       .then((j) => {
         if (!vivo) return;
