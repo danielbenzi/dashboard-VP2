@@ -65,13 +65,23 @@ const PUSHIN_PAGE_LIMIT = String(
   Math.min(100, Math.max(1, Number(process.env.PUSHIN_PAGE_LIMIT) || 100))
 );
 // Teto de páginas SÓ da PushinPay (o MAX_PAGES geral é do fallback do Abacate).
-// Quem para de verdade é o orçamento da rota; isto é rede de segurança.
-const PUSHIN_MAX_PAGES = Math.max(1, Number(process.env.PUSHIN_MAX_PAGES) || 300);
+// Quem para de verdade é o ORÇAMENTO da fonte; isto é rede de segurança. Como a
+// API ignora `per_page` e devolve ~15 por página, um mês passa fácil de 300
+// páginas — com a busca em paralelo, 600 cabe no tempo.
+const PUSHIN_MAX_PAGES = Math.max(1, Number(process.env.PUSHIN_MAX_PAGES) || 600);
 // Orçamento PRÓPRIO da PushinPay. A listagem pode ter centenas de páginas; sem
 // um teto por fonte ela come o tempo das outras e leva a rota ao 504.
 const PUSHIN_BUDGET_MS = Math.max(
   3000,
   Number(process.env.PUSHIN_BUDGET_MS) || 20000
+);
+// Páginas buscadas ao mesmo tempo quando o paginador informa `last_page`.
+// Medido em produção: a API ignora `per_page` e devolve ~15 registros por
+// página (o padrão do Laravel), então um mês vira centenas de páginas. Em
+// série isso não cabe em tempo nenhum; em paralelo cabe.
+const PUSHIN_CONCORRENCIA = Math.min(
+  16,
+  Math.max(1, Number(process.env.PUSHIN_CONCURRENCY) || 8)
 );
 // A PushinPay é uma API Laravel: status vem minúsculo ('paid'), valores em centavos.
 const PUSHIN_PAID = (process.env.PUSHIN_PAID_STATUS || "paid").toLowerCase();
@@ -755,16 +765,11 @@ async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, b
 
   const out = [];
   const seen = new Set();
-  let nextUrl = null;
-  let truncated = true;
-  let lidos = 0;        // registros vistos, pagos ou não
-  let pagina = 0;
-  let ordemDesc = null;      // a API devolve do mais novo para o mais antigo?
-  let maisNovoAnterior = null; // topo da página anterior, para descobrir a ordem
-  let foraDaJanela = 0; // registros fora de [from, to] = filtro de data ignorado
+  let lidos = 0;
+  let foraDaJanela = 0;
+  let truncated = false;
+  let falha = null;
 
-  // Falha no MEIO da paginação não pode descartar o que já foi lido — 197
-  // páginas boas valem mais que um erro. Mesmo padrão do listV2 do Abacate.
   const encerra = (msg) => {
     if (out.length === 0) {
       const salvo = srcCache.get(cacheKey);
@@ -784,56 +789,30 @@ async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, b
     return out;
   };
 
-  for (pagina = 1; pagina <= PUSHIN_MAX_PAGES; pagina++) {
-    if (orc.expired()) {
-      return encerra(
-        `estourou o tempo da fonte (${Math.round(PUSHIN_BUDGET_MS / 1000)}s) na ` +
-          `página ${pagina} — ${lidos} registros lidos, ${out.length} pagos no ` +
-          `período. Resultado PARCIAL.`
-      );
-    }
+  const montaUrl = (pagina) => {
+    const u = new URL(`${PUSHIN_BASE}${PUSHIN_LIST_PATH}`);
+    // Manda os dois nomes: medido em produção, a API ignorou `per_page` e
+    // devolveu 15 por página. `limit` é o outro nome comum e param ignorado
+    // não atrapalha.
+    u.searchParams.set("per_page", PUSHIN_PAGE_LIMIT);
+    u.searchParams.set("limit", PUSHIN_PAGE_LIMIT);
+    u.searchParams.set("page", String(pagina));
+    // Sem filtro de status de propósito: a MESMA listagem alimenta a receita
+    // (só as pagas) e o funil de conversão (criadas x pagas).
+    if (from) u.searchParams.set(PUSHIN_PARAM_FROM, from);
+    if (to) u.searchParams.set(PUSHIN_PARAM_TO, to);
+    return u.toString();
+  };
 
-    let url = nextUrl;
-    if (!url) {
-      const u = new URL(`${PUSHIN_BASE}${PUSHIN_LIST_PATH}`);
-      u.searchParams.set("per_page", PUSHIN_PAGE_LIMIT);
-      u.searchParams.set("page", String(pagina));
-      // Sem filtro de status de propósito: a MESMA listagem alimenta a receita
-      // (só as pagas) e o funil de conversão (criadas x pagas).
-      if (from) u.searchParams.set(PUSHIN_PARAM_FROM, from);
-      if (to) u.searchParams.set(PUSHIN_PARAM_TO, to);
-      url = u.toString();
-    }
-
-    const { res, json, text } = await abFetch(url, apiKey, orc);
-    if (!res.ok) {
-      // 404 na PRIMEIRA página é configuração errada — tem que ser barulhento.
-      // Nas seguintes, é falha pontual: fica com o parcial.
-      if (res.status === 404 && pagina === 1) {
-        const err = new Error(
-          `HTTP 404 em ${PUSHIN_LIST_PATH} — não existe listagem nesse caminho. ` +
-            `Confira o caminho certo no painel/doc da PushinPay e ajuste a ` +
-            `variável PUSHIN_LIST_PATH.`
-        );
-        err.status = 404;
-        throw err;
-      }
-      const detalhe = res.status === 0 ? String(text) : `HTTP ${res.status}`;
-      return encerra(
-        `parou na página ${pagina} (${detalhe}) — ${lidos} registros lidos, ` +
-          `${out.length} pagos no período. Resultado PARCIAL.`
-      );
-    }
-
-    // aceita array puro ou paginador do Laravel ({ data: [...] })
-    const raw = Array.isArray(json) ? json : (json && (json.data || json.items)) || [];
+  // Processa uma página. Devolve quantos registros INÉDITOS entraram, para
+  // detectar paginação que não anda.
+  const processa = (raw) => {
     let novos = 0;
     lidos += raw.length;
-    const datas = [];
     for (const it of raw) {
       const criadoEm = it.created_at || it.createdAt;
       const dia = toLocalDate(criadoEm);
-      if (dia) datas.push(dia);
+      if (dia && from && to && (dia < from || dia > to)) foraDaJanela++;
 
       const id = it.id || it.end_to_end_id || JSON.stringify(it);
       if (seen.has(id)) continue;
@@ -845,79 +824,208 @@ async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, b
 
       if (!pago) continue;
       const tx = normalizePushinTx(it);
-      // Filtra a janela AQUI também: se a API ignorar os parâmetros de data, o
-      // total continua certo.
       if (!inRange(tx.date, from, to)) continue;
       out.push(tx);
     }
+    return novos;
+  };
 
-    // A API respeita o filtro de data? Contar o que veio de fora responde.
-    if (from && to) for (const d of datas) if (d < from || d > to) foraDaJanela++;
+  const extrai = (json) =>
+    Array.isArray(json) ? json : (json && (json.data || json.items)) || [];
 
-    const maisNovoDaPagina = datas.length
-      ? datas.reduce((a, c) => (c > a ? c : a))
-      : null;
-
-    // A listagem vem do mais novo para o mais antigo? Primeiro tenta dentro da
-    // página; se a página inteira for do mesmo dia (acontece com volume alto),
-    // compara com o topo da página anterior.
-    if (ordemDesc === null && datas.length > 1) {
-      const pri = toLocalDate(raw[0].created_at || raw[0].createdAt);
-      const ult = toLocalDate(raw[raw.length - 1].created_at || raw[raw.length - 1].createdAt);
-      if (pri && ult && pri !== ult) ordemDesc = pri > ult;
+  // ---------- página 1: aprende o formato do paginador ----------
+  const p1 = await abFetch(montaUrl(1), apiKey, orc);
+  if (!p1.res.ok) {
+    if (p1.res.status === 404) {
+      const err = new Error(
+        `HTTP 404 em ${PUSHIN_LIST_PATH} — não existe listagem nesse caminho. ` +
+          `Confira o caminho certo no painel/doc da PushinPay e ajuste a ` +
+          `variável PUSHIN_LIST_PATH.`
+      );
+      err.status = 404;
+      throw err;
     }
-    if (ordemDesc === null && maisNovoAnterior && maisNovoDaPagina && maisNovoDaPagina !== maisNovoAnterior) {
-      ordemDesc = maisNovoDaPagina < maisNovoAnterior;
-    }
-    if (maisNovoDaPagina) maisNovoAnterior = maisNovoDaPagina;
+    const detalhe =
+      p1.res.status === 0 ? String(p1.text) : `HTTP ${p1.res.status}`;
+    return encerra(`falhou logo na primeira página (${detalhe})`);
+  }
 
-    if (novos === 0) {
-      // página repetida ou vazia — a API ignorou o cursor; parar é o certo
-      truncated = false;
-      break;
+  const raw1 = extrai(p1.json);
+  processa(raw1);
+
+  const total = num(p1.json && p1.json.total);
+  const ultima = num(p1.json && p1.json.last_page);
+  const perPageReportado = num(p1.json && p1.json.per_page);
+  const porPagina = perPageReportado || raw1.length;
+  // "página cheia" = provavelmente há mais. Só o tamanho pedido ou o `per_page`
+  // que a API DECLARA servem de régua; deduzir do próprio tamanho da resposta
+  // faria toda página parecer cheia e a paginação nunca terminaria.
+  const pareceCheia = (n) =>
+    n >= Number(PUSHIN_PAGE_LIMIT) ||
+    (perPageReportado > 0 && n >= perPageReportado);
+
+  // A API respeitou o tamanho de página pedido? Só faz sentido perguntar quando
+  // existe MAIS DE UMA página — página curta porque os dados acabaram é normal,
+  // não é a API ignorando o parâmetro.
+  if (ultima > 1 && porPagina > 0 && porPagina < Number(PUSHIN_PAGE_LIMIT)) {
+    warnings.push(
+      `PushinPay (${brandLabel}): pedi ${PUSHIN_PAGE_LIMIT} registros por página ` +
+        `e a API devolveu ${porPagina}` +
+        (total ? ` (${total} registros no período, ${ultima || "?"} páginas)` : "") +
+        `. O nome do parâmetro de tamanho de página deve ser outro — ` +
+        `/api/dashboard?debug=pushin mostra os campos que ela aceita.`
+    );
+  }
+
+  // ---------- páginas 2..N ----------
+  if (ultima > 1) {
+    // O paginador diz quantas páginas existem: dá para buscar em paralelo em
+    // vez de uma de cada vez. É isto que faz caber no tempo.
+    const teto = Math.min(ultima, PUSHIN_MAX_PAGES);
+    if (ultima > PUSHIN_MAX_PAGES) truncated = true;
+
+    // Em BLOCOS do tamanho da concorrência: rápido como o paralelo, mas ainda
+    // dá para parar entre um bloco e outro. Sem isso, uma API que ignora o
+    // filtro de data faria a gente baixar o histórico inteiro de uma vez.
+    let maisNovoAnterior = null;
+    let ordemDesc = null;
+
+    for (let inicio = 2; inicio <= teto; inicio += PUSHIN_CONCORRENCIA) {
+      if (orc.expired() || falha) break;
+      const bloco = [];
+      for (let p = inicio; p < inicio + PUSHIN_CONCORRENCIA && p <= teto; p++) {
+        bloco.push(p);
+      }
+
+      let maisNovoDoBloco = null;
+      await Promise.all(
+        bloco.map(async (p) => {
+          if (orc.expired() || falha) return;
+          const r = await abFetch(montaUrl(p), apiKey, orc);
+          if (!r.res.ok) {
+            falha = falha || {
+              pagina: p,
+              detalhe: r.res.status === 0 ? String(r.text) : `HTTP ${r.res.status}`,
+            };
+            return;
+          }
+          const raw = extrai(r.json);
+          for (const it of raw) {
+            const d = toLocalDate(it.created_at || it.createdAt);
+            if (d && (maisNovoDoBloco === null || d > maisNovoDoBloco)) {
+              maisNovoDoBloco = d;
+            }
+          }
+          processa(raw);
+        })
+      );
+
+      if (ordemDesc === null && maisNovoAnterior && maisNovoDoBloco && maisNovoDoBloco !== maisNovoAnterior) {
+        ordemDesc = maisNovoDoBloco < maisNovoAnterior;
+      }
+      if (maisNovoDoBloco) maisNovoAnterior = maisNovoDoBloco;
+
+      // bloco inteiro antes do início do período e a listagem é decrescente:
+      // o resto é mais antigo ainda, não há o que buscar
+      if (ordemDesc && from && maisNovoDoBloco && maisNovoDoBloco < from) {
+        truncated = false;
+        break;
+      }
     }
 
-    // PARADA ANTECIPADA — é isto que evita a varredura de centenas de páginas.
-    // Se a API ignora o filtro de data mas devolve do mais novo para o mais
-    // antigo, a página inteira ficar ANTES do início do período significa que
-    // não há mais nada a buscar. Sem isso, a listagem vai até o começo do
-    // histórico e estoura o tempo.
-    if (ordemDesc && from && maisNovoDaPagina && maisNovoDaPagina < from) {
-      truncated = false;
-      break;
+    if (falha) {
+      return encerra(
+        `parou na página ${falha.pagina} de ${teto} (${falha.detalhe}) — ` +
+          `${lidos} registros lidos, ${out.length} pagos no período. ` +
+          `Resultado PARCIAL.`
+      );
     }
+    if (orc.expired()) {
+      return encerra(
+        `estourou o tempo da fonte (${Math.round(PUSHIN_BUDGET_MS / 1000)}s) — ` +
+          `${lidos} de ${total || "?"} registros lidos, ${out.length} pagos no ` +
+          `período. Resultado PARCIAL. Suba PUSHIN_BUDGET_MS ou ` +
+          `PUSHIN_CONCURRENCY (hoje ${PUSHIN_CONCORRENCIA}).`
+      );
+    }
+  } else {
+    // Sem `last_page`: cai no modo antigo, seguindo cursor/número de página,
+    // com parada antecipada quando a listagem passa do início do período.
+    let nextUrl = (p1.json && (p1.json.next_page_url || p1.json.links?.next)) || null;
+    let ordemDesc = null;
+    let maisNovoAnterior = null;
+    let ultimoTamanho = raw1.length;
+    truncated = true;
 
-    const nxt = (json && (json.next_page_url || json.links?.next)) || null;
-    const cur = num(json && json.current_page);
-    const last = num(json && json.last_page);
-    const fullPage = raw.length >= Number(PUSHIN_PAGE_LIMIT);
+    for (let pagina = 2; pagina <= PUSHIN_MAX_PAGES; pagina++) {
+      if (orc.expired()) {
+        return encerra(
+          `estourou o tempo da fonte na página ${pagina} — ${lidos} registros ` +
+            `lidos, ${out.length} pagos no período. Resultado PARCIAL.`
+        );
+      }
+      if (!nextUrl && !pareceCheia(pagina === 2 ? raw1.length : ultimoTamanho)) {
+        truncated = false;
+        break;
+      }
 
-    if (nxt) {
-      nextUrl = nxt;
-      continue;
+      const r = await abFetch(nextUrl || montaUrl(pagina), apiKey, orc);
+      if (!r.res.ok) {
+        const detalhe =
+          r.res.status === 0 ? String(r.text) : `HTTP ${r.res.status}`;
+        return encerra(
+          `parou na página ${pagina} (${detalhe}) — ${lidos} registros lidos, ` +
+            `${out.length} pagos no período. Resultado PARCIAL.`
+        );
+      }
+      const raw = extrai(r.json);
+      ultimoTamanho = raw.length;
+      const datas = raw
+        .map((x) => toLocalDate(x.created_at || x.createdAt))
+        .filter(Boolean);
+      const novos = processa(raw);
+
+      const maisNovo = datas.length ? datas.reduce((a, c) => (c > a ? c : a)) : null;
+      if (ordemDesc === null && datas.length > 1) {
+        const pri = datas[0];
+        const ult = datas[datas.length - 1];
+        if (pri !== ult) ordemDesc = pri > ult;
+      }
+      if (ordemDesc === null && maisNovoAnterior && maisNovo && maisNovo !== maisNovoAnterior) {
+        ordemDesc = maisNovo < maisNovoAnterior;
+      }
+      if (maisNovo) maisNovoAnterior = maisNovo;
+
+      if (novos === 0) {
+        truncated = false;
+        break;
+      }
+      // parada antecipada: a listagem passou do início do período
+      if (ordemDesc && from && maisNovo && maisNovo < from) {
+        truncated = false;
+        break;
+      }
+      nextUrl = (r.json && (r.json.next_page_url || r.json.links?.next)) || null;
+      if (!nextUrl && !pareceCheia(raw.length)) {
+        truncated = false;
+        break;
+      }
     }
-    if ((cur && last && cur < last) || (!cur && fullPage)) {
-      nextUrl = null; // segue pelo número da página
-      continue;
-    }
-    truncated = false;
-    break;
   }
 
   if (foraDaJanela > 0) {
     warnings.push(
       `PushinPay (${brandLabel}): ${foraDaJanela} dos ${lidos} registros vieram ` +
         `fora de ${from}..${to} — os parâmetros ${PUSHIN_PARAM_FROM}/` +
-        `${PUSHIN_PARAM_TO} não estão sendo respeitados pela API. ` +
-        `Rode /api/dashboard?debug=pushin para achar os nomes certos: com o ` +
-        `filtro funcionando, essa consulta lê uma fração das páginas.`
+        `${PUSHIN_PARAM_TO} não estão sendo respeitados pela API.`
     );
   }
   if (truncated) {
     warnings.push(
-      `PushinPay (${brandLabel}): parou no limite de ${PUSHIN_MAX_PAGES} páginas — ` +
-        `${lidos} registros lidos, ${out.length} pagos no período. Pode haver ` +
-        `pagamentos não contabilizados.`
+      `PushinPay (${brandLabel}): o período tem ${total || "?"} registros em ` +
+        `${ultima || "?"} páginas, acima do teto de ${PUSHIN_MAX_PAGES} — ` +
+        `${lidos} lidos, ${out.length} pagos. Pode haver pagamentos não ` +
+        `contabilizados; suba PUSHIN_MAX_PAGES.`
     );
   }
 
