@@ -116,6 +116,21 @@ const REPEAT_MIN_GAP_MIN = Math.max(
   Number(process.env.REPEAT_MIN_GAP_MINUTES) || 0
 );
 const REPEAT_CACHE_TTL_MS = 10 * 60 * 1000;
+
+// ---------- Receita a partir do Postgres ----------
+// O dashboard reconstruía o histórico raspando as APIs de gateway a cada
+// carregamento: ~460 chamadas HTTP para montar 8 dias. Isso deu timeout,
+// depois 429, e não existe valor de concorrência que caiba nos dois limites.
+// O dado já está no banco — é a mesma fonte que a régua de reconsulta e a
+// conversão offline do Google Ads usam. Uma query no lugar de 460 chamadas.
+//
+// 'api' (padrão) mantém o comportamento antigo. 'db' lê do Postgres e NÃO
+// chama gateway nenhum — o que também mata o 401 do AbacatePay.
+const REVENUE_SOURCE = (process.env.REVENUE_SOURCE || "api").toLowerCase();
+const DB_PAID_VIEW = process.env.DB_PAID_VIEW || REPEAT_VIEW;
+// Valor em centavos no banco? Não adivinho: o ?debug=fontes mostra a razão
+// entre banco e API e diz se isto precisa virar 100.
+const DB_AMOUNT_DIVISOR = Number(process.env.DB_AMOUNT_DIVISOR) || 1;
 const repeatCache = new Map(); // lookback -> { at, payload }
 
 // Cache em memória (por instância warm da função)
@@ -1326,6 +1341,82 @@ function escolheColunas(cols) {
   return { email, data, temporais: [...temporais] };
 }
 
+// Escolhe as colunas de receita da view sem depender de schema conhecido.
+// `paidAtBr` (a coluna em horário de Brasília criada no ajuste da conversão
+// offline) tem prioridade: evita todo o problema de fuso.
+const PREF_DATA_RECEITA = [
+  "paidatbr", "paid_at_br", "paidat", "paid_at", "paymentdate", "payment_date",
+  "data_pagamento", "createdat", "created_at",
+];
+function escolheColunasReceita(cols) {
+  const nomes = cols.map((c) => c.column_name);
+  const tipo = Object.fromEntries(cols.map((c) => [c.column_name, c.data_type]));
+  const acha = (re, filtro) =>
+    nomes.find((n) => re.test(n) && (!filtro || filtro(tipo[n])));
+
+  const temporal = (t) => /timestamp|date/i.test(t);
+  const numerico = (t) => /numeric|integer|bigint|double|real|money|decimal/i.test(t);
+
+  let data = process.env.DB_DATE_COL && nomes.includes(process.env.DB_DATE_COL)
+    ? process.env.DB_DATE_COL
+    : null;
+  if (!data) {
+    for (const pref of PREF_DATA_RECEITA) {
+      const achado = nomes.find((n) => n.toLowerCase() === pref && temporal(tipo[n]));
+      if (achado) { data = achado; break; }
+    }
+  }
+  if (!data) data = acha(/./, temporal) || null;
+
+  const valor =
+    (process.env.DB_AMOUNT_COL && nomes.includes(process.env.DB_AMOUNT_COL) && process.env.DB_AMOUNT_COL) ||
+    acha(/^(amount|value|valor|total|price|preco)$/i, numerico) ||
+    acha(/amount|valor|value|total/i, numerico) ||
+    null;
+
+  // gateway: coluna própria, ou o campo dentro do metadata (a chave é
+  // `provider`/`source`, não `gateway` — vide diagnóstico da conversão offline)
+  const colGateway =
+    (process.env.DB_GATEWAY_COL && nomes.includes(process.env.DB_GATEWAY_COL) && process.env.DB_GATEWAY_COL) ||
+    acha(/^(provider|gateway|source|psp)$/i) ||
+    acha(/provider|gateway/i) ||
+    null;
+  const colMetadata = acha(/^(metadata|meta|extra)$/i, (t) => /json/i.test(t));
+  const gateway = colGateway
+    ? `${qIdent(colGateway)}`
+    : colMetadata
+    ? `COALESCE(${qIdent(colMetadata)} ->> 'provider', ${qIdent(colMetadata)} ->> 'source')`
+    : `NULL`;
+
+  const colMarca =
+    (process.env.DB_BRAND_COL && nomes.includes(process.env.DB_BRAND_COL) && process.env.DB_BRAND_COL) ||
+    acha(/^(brand|marca|product|produto|tenant|site|dominio|domain)$/i) ||
+    null;
+
+  return { data, valor, colGateway, colMetadata, gateway, colMarca };
+}
+
+// Receita por dia x gateway x marca, direto do banco. Uma varredura, sem
+// paginação, sem rate limit.
+function buildReceitaSql(view, c) {
+  const { schema, table } = splitView(view);
+  const D = qIdent(c.data);
+  const V = qIdent(c.valor);
+  const M = c.colMarca ? qIdent(c.colMarca) : "NULL";
+  return `
+SELECT to_char(${D}::timestamp, 'YYYY-MM-DD')          AS dia,
+       COALESCE(NULLIF(${c.gateway}, ''), 'desconhecido') AS gateway,
+       ${M}                                            AS marca,
+       count(*)                                        AS transacoes,
+       COALESCE(sum(${V}), 0)                          AS receita
+FROM ${qIdent(schema)}.${qIdent(table)}
+WHERE ${D} IS NOT NULL
+  AND ${D}::timestamp >= $1::timestamp
+  AND ${D}::timestamp <  ($2::date + 1)::timestamp
+GROUP BY 1, 2, 3
+ORDER BY 1;`;
+}
+
 // Uma varredura só. O `pares` casa cada compra com as compras seguintes DO
 // MESMO e-mail limitadas à maior janela — o join não explode porque a maioria
 // dos e-mails tem 1 ou 2 compras.
@@ -1492,8 +1583,8 @@ async function comCliente(fn) {
   }
 }
 
-async function lerColunas(client) {
-  const { schema, table } = splitView(REPEAT_VIEW);
+async function lerColunas(client, alvo = REPEAT_VIEW) {
+  const { schema, table } = splitView(alvo);
   const { rows } = await client.query(
     `SELECT column_name, data_type
        FROM information_schema.columns
@@ -1503,11 +1594,160 @@ async function lerColunas(client) {
   );
   if (rows.length === 0) {
     throw new Error(
-      `a view ${REPEAT_VIEW} não existe ou o usuário do DATABASE_URL não enxerga ela. ` +
-        `Ajuste REPEAT_VIEW ou dê SELECT para o usuário.`
+      `a view ${alvo} não existe ou o usuário do DATABASE_URL não enxerga ela. ` +
+        `Ajuste REPEAT_VIEW/DB_PAID_VIEW ou dê SELECT para o usuário.`
     );
   }
   return rows;
+}
+
+// Nome de gateway do banco -> mesmo rótulo que a UI já usa nas APIs
+function rotuloGateway(v) {
+  const g = String(v || "").toLowerCase();
+  if (g.includes("pushin")) return "PushinPay";
+  if (g.includes("abacate")) return "Abacate";
+  if (g.includes("stripe")) return "Stripe";
+  if (!g || g === "desconhecido") return "desconhecido";
+  return v;
+}
+
+// Lê a receita do banco e devolve no MESMO formato das APIs
+// ({ amount, date, source }), agrupada por marca.
+async function fetchReceitaDoBanco(from, to, nomes) {
+  return comCliente(async (client) => {
+    const cols = await lerColunas(client, DB_PAID_VIEW);
+    const c = escolheColunasReceita(cols);
+    if (!c.data || !c.valor) {
+      throw new Error(
+        `não achei coluna de ${!c.data ? "data" : "valor"} em ${DB_PAID_VIEW}. ` +
+          `Colunas: ${cols.map((x) => x.column_name).join(", ")}. ` +
+          `Defina DB_DATE_COL / DB_AMOUNT_COL.`
+      );
+    }
+    const { rows } = await client.query(buildReceitaSql(DB_PAID_VIEW, c), [from, to]);
+
+    // marca: se a view não distingue, tudo vai para a primeira e isso é dito
+    // em voz alta — número de marca errado é pior que número ausente.
+    const porMarca = Object.fromEntries(nomes.map((n) => [n, []]));
+    const marcasVistas = new Set();
+    for (const r of rows) {
+      const marcaBruta = r.marca == null ? null : String(r.marca);
+      if (marcaBruta) marcasVistas.add(marcaBruta);
+      const alvo =
+        (marcaBruta && /placa/i.test(marcaBruta) ? nomes[1] : null) ||
+        (marcaBruta && /processo/i.test(marcaBruta) ? nomes[0] : null) ||
+        nomes[0];
+      porMarca[alvo].push({
+        amount: num(r.receita) / DB_AMOUNT_DIVISOR,
+        count: num(r.transacoes),
+        date: String(r.dia),
+        source: rotuloGateway(r.gateway),
+      });
+    }
+    return {
+      colunas: {
+        data: c.data,
+        valor: c.valor,
+        gateway: c.colGateway || (c.colMetadata ? `${c.colMetadata}->>provider|source` : null),
+        marca: c.colMarca,
+      },
+      separaPorMarca: Boolean(c.colMarca),
+      marcasVistas: [...marcasVistas],
+      porMarca,
+      linhas: rows.length,
+    };
+  });
+}
+
+// GET /api/dashboard?debug=fontes — banco x API lado a lado, mesmo período.
+// É a conferência que decide se dá para virar a chave REVENUE_SOURCE=db.
+async function debugFontes(from, to, nomes) {
+  const budget = makeBudget(40000);
+  const soma = (txs) =>
+    txs
+      .filter((t) => inRange(t.date, from, to))
+      .reduce(
+        (a, t) => ({
+          receita: a.receita + t.amount,
+          transacoes: a.transacoes + (num(t.count) || 1),
+        }),
+        { receita: 0, transacoes: 0 }
+      );
+  const porFonte = (txs) => {
+    const m = {};
+    for (const t of txs.filter((x) => inRange(x.date, from, to))) {
+      const k = t.source || "desconhecido";
+      m[k] = m[k] || { receita: 0, transacoes: 0 };
+      m[k].receita += t.amount;
+      m[k].transacoes += num(t.count) || 1;
+    }
+    for (const k of Object.keys(m)) m[k].receita = Number(m[k].receita.toFixed(2));
+    return m;
+  };
+
+  const lixo = [];
+  const [banco, abProc, abPlaca, stProc, stPlaca, pxProc, pxPlaca] = await Promise.all([
+    fetchReceitaDoBanco(from, to, nomes).catch((e) => ({ erro: String(e?.message || e) })),
+    fetchAbacateTransactions(process.env.ABACATE_KEY_PROCESSO, from, to, lixo, "Processo", budget).catch(() => []),
+    fetchAbacateTransactions(process.env.ABACATE_KEY_PLACA, from, to, lixo, "Placa", budget).catch(() => []),
+    fetchStripeTransactions(process.env.STRIPE_KEY_PROCESSO, from, to, lixo, "Processo", budget).catch(() => []),
+    fetchStripeTransactions(process.env.STRIPE_KEY_PLACA, from, to, lixo, "Placa", budget).catch(() => []),
+    fetchPushinTransactions(process.env.PUSHIN_KEY_PROCESSO, from, to, lixo, "Processo", budget, null, lixo).catch(() => []),
+    fetchPushinTransactions(process.env.PUSHIN_KEY_PLACA, from, to, lixo, "Placa", budget, null, lixo).catch(() => []),
+  ]);
+
+  const apiTx = [...abProc, ...abPlaca, ...stProc, ...stPlaca, ...pxProc, ...pxPlaca];
+  const api = soma(apiTx);
+  const bancoTx = banco.erro ? [] : Object.values(banco.porMarca).flat();
+  const bd = soma(bancoTx);
+  const razao = api.receita > 0 ? bd.receita / api.receita : null;
+
+  return {
+    periodo: { from, to },
+    banco: banco.erro
+      ? { erro: banco.erro }
+      : {
+          view: DB_PAID_VIEW,
+          colunasDetectadas: banco.colunas,
+          separaPorMarca: banco.separaPorMarca,
+          marcasVistas: banco.marcasVistas,
+          totais: { receita: Number(bd.receita.toFixed(2)), transacoes: bd.transacoes },
+          porFonte: porFonte(bancoTx),
+        },
+    api: {
+      totais: { receita: Number(api.receita.toFixed(2)), transacoes: api.transacoes },
+      porFonte: porFonte(apiTx),
+      avisos: lixo.filter((x) => typeof x === "string").slice(0, 8),
+    },
+    // alertas valem independente de os totais baterem — não podem ficar
+    // escondidos dentro do veredito
+    alertas: banco.erro
+      ? ["o banco não respondeu"]
+      : [
+          banco.separaPorMarca
+            ? null
+            : `a view ${DB_PAID_VIEW} não tem coluna de marca: com REVENUE_SOURCE=db ` +
+              `o TOTAL fica certo, mas tudo é somado na primeira marca`,
+          razao != null && razao > 50 && razao < 200
+            ? "valor do banco parece estar em CENTAVOS — defina DB_AMOUNT_DIVISOR=100"
+            : null,
+          lixo.some((x) => typeof x === "string" && /PARCIAL/.test(x))
+            ? "a leitura pela API veio PARCIAL neste período — ela é o lado não confiável da comparação, não o banco"
+            : null,
+        ].filter(Boolean),
+    veredito: banco.erro
+      ? "o banco não respondeu — resolva isso antes de virar a chave"
+      : razao == null
+      ? "a API não trouxe nada para comparar (veja os avisos)"
+      : razao > 50 && razao < 200
+      ? `o banco está ${razao.toFixed(0)}x a API: o valor está em CENTAVOS. ` +
+        `Defina DB_AMOUNT_DIVISOR=100 e rode de novo.`
+      : Math.abs(razao - 1) <= 0.02
+      ? "batem dentro de 2% — pode virar REVENUE_SOURCE=db" +
+        (banco.separaPorMarca ? "" : ". ATENÇÃO: a view não separa marca, tudo cai na primeira")
+      : `divergência de ${((razao - 1) * 100).toFixed(1)}% — investigue antes de virar a chave. ` +
+        `Lembre que a API pode estar PARCIAL (veja api.avisos): nesse caso o banco maior é o esperado.`,
+  };
 }
 
 // GET /api/dashboard?repeat=1  (&dias=730, &debug=1, &refresh=1)
@@ -1588,6 +1828,24 @@ export async function GET(request) {
   // /api/dashboard?repeat=1 — recompra por e-mail, lida do Postgres
   if (searchParams.get("repeat") === "1") return handleRepeat(searchParams);
 
+  // /api/dashboard?debug=fontes — banco x API, para decidir a migração
+  if (searchParams.get("debug") === "fontes") {
+    const nomes = [
+      process.env.GADS_ACCOUNT_PROCESSO || "Verifica Processo",
+      process.env.GADS_ACCOUNT_PLACA || "Verifica Placa",
+    ];
+    try {
+      return NextResponse.json(await debugFontes(from, to, nomes), {
+        headers: { "Cache-Control": "no-store" },
+      });
+    } catch (e) {
+      return NextResponse.json(
+        { erro: String(e?.message || e) },
+        { status: 500, headers: { "Cache-Control": "no-store" } }
+      );
+    }
+  }
+
   // /api/dashboard?debug=pushin — diagnóstico, não devolve dado de venda
   if (searchParams.get("debug") === "pushin") {
     const dbg = makeBudget(20000);
@@ -1638,10 +1896,16 @@ export async function GET(request) {
       (value) => ({ status: "fulfilled", value }),
       (reason) => ({ status: "rejected", reason })
     );
+
+  // Com REVENUE_SOURCE=db o dashboard NÃO chama gateway nenhum: uma query
+  // substitui as centenas de chamadas paginadas (e o 401 do Abacate junto).
+  const usandoBanco = REVENUE_SOURCE === "db";
+  const vazio = () => Promise.resolve([]);
+
   const results = await Promise.all([
     settle(fetchGoogleAds(from, to, budget)),
     settle(
-      fetchAbacateTransactions(
+      usandoBanco ? vazio() : fetchAbacateTransactions(
         process.env.ABACATE_KEY_PROCESSO,
         from,
         to,
@@ -1652,7 +1916,7 @@ export async function GET(request) {
       )
     ),
     settle(
-      fetchAbacateTransactions(
+      usandoBanco ? vazio() : fetchAbacateTransactions(
         process.env.ABACATE_KEY_PLACA,
         from,
         to,
@@ -1663,7 +1927,7 @@ export async function GET(request) {
       )
     ),
     settle(
-      fetchStripeTransactions(
+      usandoBanco ? vazio() : fetchStripeTransactions(
         process.env.STRIPE_KEY_PROCESSO,
         from,
         to,
@@ -1674,7 +1938,7 @@ export async function GET(request) {
       )
     ),
     settle(
-      fetchStripeTransactions(
+      usandoBanco ? vazio() : fetchStripeTransactions(
         process.env.STRIPE_KEY_PLACA,
         from,
         to,
@@ -1688,7 +1952,7 @@ export async function GET(request) {
     // índices de results usados abaixo
     settle(fetchGoogleAdsHourly(to, budget)),
     settle(
-      fetchPushinTransactions(
+      usandoBanco ? vazio() : fetchPushinTransactions(
         process.env.PUSHIN_KEY_PROCESSO,
         from,
         to,
@@ -1700,7 +1964,7 @@ export async function GET(request) {
       )
     ),
     settle(
-      fetchPushinTransactions(
+      usandoBanco ? vazio() : fetchPushinTransactions(
         process.env.PUSHIN_KEY_PLACA,
         from,
         to,
@@ -1747,6 +2011,28 @@ export async function GET(request) {
 
   if (results[7].status === "fulfilled") txPlaca = txPlaca.concat(results[7].value);
   else warnings.push(`PushinPay (Placa): ${label(results[7])}`);
+
+  // receita do banco entra aqui, no lugar do que as APIs trariam
+  if (usandoBanco) {
+    try {
+      const bd = await fetchReceitaDoBanco(from, to, [nameProcesso, namePlaca]);
+      txProcesso = bd.porMarca[nameProcesso] || [];
+      txPlaca = bd.porMarca[namePlaca] || [];
+      if (!bd.separaPorMarca) {
+        notas.push(
+          `Receita lida do banco (${DB_PAID_VIEW}), mas a view não tem coluna de ` +
+            `marca — tudo está somado em ${nameProcesso}. O total está certo; a ` +
+            `divisão por marca, não.`
+        );
+      }
+      notas.push(
+        `Receita e transações vindas do Postgres, não das APIs de gateway ` +
+          `(${bd.linhas} linhas agregadas).`
+      );
+    } catch (e) {
+      errors.push(`Banco (receita): ${e?.message || e}`);
+    }
+  }
 
   const brands = [
     buildBrand(nameProcesso, gadsRows, txProcesso, [...funnelProcesso.values()], from, to),
