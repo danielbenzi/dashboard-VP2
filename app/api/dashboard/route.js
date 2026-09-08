@@ -756,7 +756,7 @@ function normalizePushinTx(it) {
   return { amount: num(cents) / 100, date: toLocalDate(raw), source: "PushinPay" };
 }
 
-async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, budget, funnel) {
+async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, budget, funnel, notas) {
   if (!apiKey) return [];
 
   // teto próprio: a PushinPay não pode consumir o orçamento das outras fontes
@@ -868,7 +868,9 @@ async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, b
     // dados acabaram é normal, não é a API ignorando o parâmetro
     (ultima > 1 || (p1.json && (p1.json.next_page_url || p1.json.links?.next)))
   ) {
-    warnings.push(
+    // NOTA, não aviso: com a busca em paralelo a varredura termina do mesmo
+    // jeito. Achar o nome certo só a deixa mais folgada.
+    (notas || warnings).push(
       `PushinPay (${brandLabel}): pedi ${PUSHIN_PAGE_LIMIT} registros por página ` +
         `e a API devolveu ${porPagina}` +
         (total ? ` (${total} registros no período, ${ultima || "?"} páginas)` : "") +
@@ -1011,11 +1013,23 @@ async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, b
     truncated = true;
   }
 
-  if (foraDaJanela > 0) {
+  // Registros fora da janela: uma FRAÇÃO pequena é borda, não filtro quebrado.
+  // A API filtra por uma data (provavelmente a do pagamento) e o funil conta
+  // pela data de CRIAÇÃO — um PIX gerado 31/08 23h50 e pago 01/09 00h10 cai
+  // legitimamente nos dois lados dessa fronteira.
+  const fatiaFora = lidos > 0 ? foraDaJanela / lidos : 0;
+  if (fatiaFora > 0.05) {
     warnings.push(
-      `PushinPay (${brandLabel}): ${foraDaJanela} dos ${lidos} registros vieram ` +
-        `fora de ${from}..${to} — os parâmetros ${PUSHIN_PARAM_FROM}/` +
-        `${PUSHIN_PARAM_TO} não estão sendo respeitados pela API.`
+      `PushinPay (${brandLabel}): ${foraDaJanela} dos ${lidos} registros ` +
+        `(${(fatiaFora * 100).toFixed(0)}%) vieram fora de ${from}..${to} — os ` +
+        `parâmetros ${PUSHIN_PARAM_FROM}/${PUSHIN_PARAM_TO} não estão sendo ` +
+        `respeitados pela API.`
+    );
+  } else if (foraDaJanela > 0) {
+    (notas || warnings).push(
+      `PushinPay (${brandLabel}): ${foraDaJanela} de ${lidos} registros ` +
+        `(${(fatiaFora * 100).toFixed(2)}%) caíram na borda do período — ` +
+        `cobrança criada num dia e paga no outro. Normal, não afeta a receita.`
     );
   }
   if (truncated) {
@@ -1558,6 +1572,9 @@ export async function GET(request) {
 
   const errors = [];
   const warnings = [];
+  // Diagnóstico ≠ falha. Nota não deixa o payload "incompleto" nem pinta o
+  // banner vermelho — senão ele fica sempre aceso e você para de olhar.
+  const notas = [];
   let gadsRows = [];
   let txProcesso = [];
   let txPlaca = [];
@@ -1631,7 +1648,8 @@ export async function GET(request) {
         warnings,
         "Processo",
         budget,
-        funnelProcesso
+        funnelProcesso,
+        notas
       )
     ),
     settle(
@@ -1642,7 +1660,8 @@ export async function GET(request) {
         warnings,
         "Placa",
         budget,
-        funnelPlaca
+        funnelPlaca,
+        notas
       )
     ),
   ]);
@@ -1754,6 +1773,7 @@ export async function GET(request) {
     brands,
     hourly: { day: to, rows: hourlyRows },
     errors: [...errors, ...warnings],
+    notes: notas,
   };
 
   const complete = errors.length === 0 && warnings.length === 0;
