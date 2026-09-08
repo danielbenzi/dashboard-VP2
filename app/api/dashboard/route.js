@@ -67,6 +67,12 @@ const PUSHIN_PAGE_LIMIT = String(
 // Teto de páginas SÓ da PushinPay (o MAX_PAGES geral é do fallback do Abacate).
 // Quem para de verdade é o orçamento da rota; isto é rede de segurança.
 const PUSHIN_MAX_PAGES = Math.max(1, Number(process.env.PUSHIN_MAX_PAGES) || 300);
+// Orçamento PRÓPRIO da PushinPay. A listagem pode ter centenas de páginas; sem
+// um teto por fonte ela come o tempo das outras e leva a rota ao 504.
+const PUSHIN_BUDGET_MS = Math.max(
+  3000,
+  Number(process.env.PUSHIN_BUDGET_MS) || 20000
+);
 // A PushinPay é uma API Laravel: status vem minúsculo ('paid'), valores em centavos.
 const PUSHIN_PAID = (process.env.PUSHIN_PAID_STATUS || "paid").toLowerCase();
 
@@ -743,61 +749,142 @@ function normalizePushinTx(it) {
 async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, budget, funnel) {
   if (!apiKey) return [];
 
+  // teto próprio: a PushinPay não pode consumir o orçamento das outras fontes
+  const orc = sliceBudget(budget, PUSHIN_BUDGET_MS);
+  const cacheKey = `pushin:${apiKey.slice(0, 12)}:${from}:${to}`;
+
   const out = [];
   const seen = new Set();
   let nextUrl = null;
   let truncated = true;
-  let lidos = 0; // registros vistos, pagos ou não — o out só guarda os pagos
+  let lidos = 0;        // registros vistos, pagos ou não
+  let pagina = 0;
+  let ordemDesc = null;      // a API devolve do mais novo para o mais antigo?
+  let maisNovoAnterior = null; // topo da página anterior, para descobrir a ordem
+  let foraDaJanela = 0; // registros fora de [from, to] = filtro de data ignorado
 
-  for (let page = 1; page <= PUSHIN_MAX_PAGES; page++) {
-    if (budget.expired()) throw budgetError();
+  // Falha no MEIO da paginação não pode descartar o que já foi lido — 197
+  // páginas boas valem mais que um erro. Mesmo padrão do listV2 do Abacate.
+  const encerra = (msg) => {
+    if (out.length === 0) {
+      const salvo = srcCache.get(cacheKey);
+      if (salvo) {
+        const hora = new Date(salvo.at).toLocaleTimeString("pt-BR", {
+          timeZone: TZ,
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+        warnings.push(
+          `PushinPay (${brandLabel}): ${msg} — usando os dados salvos das ${hora}`
+        );
+        return salvo.items;
+      }
+    }
+    warnings.push(`PushinPay (${brandLabel}): ${msg}`);
+    return out;
+  };
+
+  for (pagina = 1; pagina <= PUSHIN_MAX_PAGES; pagina++) {
+    if (orc.expired()) {
+      return encerra(
+        `estourou o tempo da fonte (${Math.round(PUSHIN_BUDGET_MS / 1000)}s) na ` +
+          `página ${pagina} — ${lidos} registros lidos, ${out.length} pagos no ` +
+          `período. Resultado PARCIAL.`
+      );
+    }
 
     let url = nextUrl;
     if (!url) {
       const u = new URL(`${PUSHIN_BASE}${PUSHIN_LIST_PATH}`);
       u.searchParams.set("per_page", PUSHIN_PAGE_LIMIT);
-      u.searchParams.set("page", String(page));
+      u.searchParams.set("page", String(pagina));
       // Sem filtro de status de propósito: a MESMA listagem alimenta a receita
-      // (só as pagas) e o funil de conversão (criadas x pagas). Filtrar no
-      // servidor daria a receita certa e um funil sempre 100%.
+      // (só as pagas) e o funil de conversão (criadas x pagas).
       if (from) u.searchParams.set(PUSHIN_PARAM_FROM, from);
       if (to) u.searchParams.set(PUSHIN_PARAM_TO, to);
       url = u.toString();
     }
 
-    // mesmo helper do Abacate: Bearer + JSON, com retry e respeito ao orçamento
-    const { res, json, text } = await abFetch(url, apiKey, budget);
+    const { res, json, text } = await abFetch(url, apiKey, orc);
     if (!res.ok) {
-      const err = new Error(
-        res.status === 404
-          ? `HTTP 404 em ${PUSHIN_LIST_PATH} — não existe listagem nesse caminho. ` +
-            `Confira o caminho certo no painel/doc da PushinPay e ajuste a variável ` +
-            `PUSHIN_LIST_PATH (a doc pública só descreve /pix/cashIn e /transaction/{id}).`
-          : `HTTP ${res.status} (página ${page}): ${String(text).slice(0, 200)}`
+      // 404 na PRIMEIRA página é configuração errada — tem que ser barulhento.
+      // Nas seguintes, é falha pontual: fica com o parcial.
+      if (res.status === 404 && pagina === 1) {
+        const err = new Error(
+          `HTTP 404 em ${PUSHIN_LIST_PATH} — não existe listagem nesse caminho. ` +
+            `Confira o caminho certo no painel/doc da PushinPay e ajuste a ` +
+            `variável PUSHIN_LIST_PATH.`
+        );
+        err.status = 404;
+        throw err;
+      }
+      const detalhe = res.status === 0 ? String(text) : `HTTP ${res.status}`;
+      return encerra(
+        `parou na página ${pagina} (${detalhe}) — ${lidos} registros lidos, ` +
+          `${out.length} pagos no período. Resultado PARCIAL.`
       );
-      err.status = res.status;
-      throw err;
     }
 
     // aceita array puro ou paginador do Laravel ({ data: [...] })
     const raw = Array.isArray(json) ? json : (json && (json.data || json.items)) || [];
     let novos = 0;
     lidos += raw.length;
+    const datas = [];
     for (const it of raw) {
+      const criadoEm = it.created_at || it.createdAt;
+      const dia = toLocalDate(criadoEm);
+      if (dia) datas.push(dia);
+
       const id = it.id || it.end_to_end_id || JSON.stringify(it);
       if (seen.has(id)) continue;
       seen.add(id);
       novos++;
 
       const pago = String(it.status || "").toLowerCase() === PUSHIN_PAID;
-      bumpFunnel(funnel, "PushinPay", it.created_at || it.createdAt, pago);
+      bumpFunnel(funnel, "PushinPay", criadoEm, pago);
 
       if (!pago) continue;
       const tx = normalizePushinTx(it);
       // Filtra a janela AQUI também: se a API ignorar os parâmetros de data, o
-      // total continua certo — só custa mais páginas.
+      // total continua certo.
       if (!inRange(tx.date, from, to)) continue;
       out.push(tx);
+    }
+
+    // A API respeita o filtro de data? Contar o que veio de fora responde.
+    if (from && to) for (const d of datas) if (d < from || d > to) foraDaJanela++;
+
+    const maisNovoDaPagina = datas.length
+      ? datas.reduce((a, c) => (c > a ? c : a))
+      : null;
+
+    // A listagem vem do mais novo para o mais antigo? Primeiro tenta dentro da
+    // página; se a página inteira for do mesmo dia (acontece com volume alto),
+    // compara com o topo da página anterior.
+    if (ordemDesc === null && datas.length > 1) {
+      const pri = toLocalDate(raw[0].created_at || raw[0].createdAt);
+      const ult = toLocalDate(raw[raw.length - 1].created_at || raw[raw.length - 1].createdAt);
+      if (pri && ult && pri !== ult) ordemDesc = pri > ult;
+    }
+    if (ordemDesc === null && maisNovoAnterior && maisNovoDaPagina && maisNovoDaPagina !== maisNovoAnterior) {
+      ordemDesc = maisNovoDaPagina < maisNovoAnterior;
+    }
+    if (maisNovoDaPagina) maisNovoAnterior = maisNovoDaPagina;
+
+    if (novos === 0) {
+      // página repetida ou vazia — a API ignorou o cursor; parar é o certo
+      truncated = false;
+      break;
+    }
+
+    // PARADA ANTECIPADA — é isto que evita a varredura de centenas de páginas.
+    // Se a API ignora o filtro de data mas devolve do mais novo para o mais
+    // antigo, a página inteira ficar ANTES do início do período significa que
+    // não há mais nada a buscar. Sem isso, a listagem vai até o começo do
+    // histórico e estoura o tempo.
+    if (ordemDesc && from && maisNovoDaPagina && maisNovoDaPagina < from) {
+      truncated = false;
+      break;
     }
 
     const nxt = (json && (json.next_page_url || json.links?.next)) || null;
@@ -805,11 +892,6 @@ async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, b
     const last = num(json && json.last_page);
     const fullPage = raw.length >= Number(PUSHIN_PAGE_LIMIT);
 
-    if (novos === 0) {
-      // página repetida ou vazia — a API ignorou o cursor; parar é o certo
-      truncated = false;
-      break;
-    }
     if (nxt) {
       nextUrl = nxt;
       continue;
@@ -822,14 +904,24 @@ async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, b
     break;
   }
 
+  if (foraDaJanela > 0) {
+    warnings.push(
+      `PushinPay (${brandLabel}): ${foraDaJanela} dos ${lidos} registros vieram ` +
+        `fora de ${from}..${to} — os parâmetros ${PUSHIN_PARAM_FROM}/` +
+        `${PUSHIN_PARAM_TO} não estão sendo respeitados pela API. ` +
+        `Rode /api/dashboard?debug=pushin para achar os nomes certos: com o ` +
+        `filtro funcionando, essa consulta lê uma fração das páginas.`
+    );
+  }
   if (truncated) {
     warnings.push(
       `PushinPay (${brandLabel}): parou no limite de ${PUSHIN_MAX_PAGES} páginas — ` +
         `${lidos} registros lidos, ${out.length} pagos no período. Pode haver ` +
-        `pagamentos não contabilizados. Rode /api/dashboard?debug=pushin para ver ` +
-        `se os filtros de data e de status estão sendo respeitados pela API.`
+        `pagamentos não contabilizados.`
     );
   }
+
+  srcCache.set(cacheKey, { at: Date.now(), items: out });
   return out;
 }
 
