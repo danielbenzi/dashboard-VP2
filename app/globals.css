@@ -271,3 +271,18 @@ body {
   background: var(--amber);
   border-radius: 4px;
 }
+
+/* observações: diagnóstico que NÃO é falha — some do vermelho de propósito */
+.nota {
+  background: rgba(139, 151, 171, 0.08);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-size: 12px;
+  margin-bottom: 18px;
+}
+.nota ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
