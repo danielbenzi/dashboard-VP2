@@ -183,6 +183,18 @@ export default function Page() {
           </ul>
         </div>
       )}
+      {/* Diagnóstico ≠ falha. Fica fora do banner vermelho para o vermelho
+          continuar significando "tem número faltando". */}
+      {data?.notes?.length > 0 && (
+        <div className="nota">
+          Observações (não afetam os números):
+          <ul>
+            {data.notes.map((n, i) => (
+              <li key={i}>{n}</li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {loading && !data && <div className="loading">Carregando dados…</div>}
 
