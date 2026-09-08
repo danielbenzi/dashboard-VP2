@@ -79,9 +79,11 @@ const PUSHIN_BUDGET_MS = Math.max(
 // Medido em produção: a API ignora `per_page` e devolve ~15 registros por
 // página (o padrão do Laravel), então um mês vira centenas de páginas. Em
 // série isso não cabe em tempo nenhum; em paralelo cabe.
+// 4, não 8: com 8 a API respondeu HTTP 429 (limite de taxa) em produção. A
+// varredura ainda reduz sozinha se levar 429 mesmo assim.
 const PUSHIN_CONCORRENCIA = Math.min(
   16,
-  Math.max(1, Number(process.env.PUSHIN_CONCURRENCY) || 8)
+  Math.max(1, Number(process.env.PUSHIN_CONCURRENCY) || 4)
 );
 // A PushinPay é uma API Laravel: status vem minúsculo ('paid'), valores em centavos.
 const PUSHIN_PAID = (process.env.PUSHIN_PAID_STATUS || "paid").toLowerCase();
@@ -266,12 +268,19 @@ async function fetchGoogleAdsHourly(day, budget) {
 // ---------- AbacatePay ----------
 async function abFetch(url, apiKey, budget) {
   let last = null;
+  let esperaSugerida = 0; // vem do Retry-After quando a API limita a taxa
+  let limitado = false;   // levou 429 em alguma tentativa, mesmo se depois deu certo
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     if (budget.expired()) break;
     if (attempt > 0) {
-      const wait = Math.min(600 * 2 ** (attempt - 1), budget.left() - 1000);
+      const padrao = 600 * 2 ** (attempt - 1);
+      const wait = Math.min(
+        Math.max(esperaSugerida, padrao),
+        budget.left() - 1000
+      );
       if (wait <= 0) break;
       await new Promise((r) => setTimeout(r, wait));
+      esperaSugerida = 0;
     }
     try {
       const res = await tFetch(
@@ -292,8 +301,16 @@ async function abFetch(url, apiKey, budget) {
         /* resposta não-JSON */
       }
       const failed = !res.ok || (json && json.success === false);
-      if (!failed) return { res, json, text };
+      if (!failed) return { res, json, text, limitado };
       last = { res, json, text };
+      // 429 é o único que PEDE nova tentativa: a API está pedindo para esperar.
+      // Se ela disser quanto, obedece.
+      if (res.status === 429) {
+        limitado = true;
+        const ra = Number(res.headers && res.headers.get && res.headers.get("retry-after"));
+        esperaSugerida = Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 8000) : 0;
+        continue;
+      }
       // autenticação e rota inexistente não se resolvem com retry — insistir só
       // gasta orçamento que as outras fontes precisam
       if (res.status === 401 || res.status === 403 || res.status === 404) break;
@@ -309,13 +326,14 @@ async function abFetch(url, apiKey, budget) {
       if (isTimeout) break;
     }
   }
-  return (
-    last || {
-      res: { ok: false, status: 0 },
-      json: null,
-      text: "tempo da requisição esgotado",
-    }
-  );
+  return last
+    ? { ...last, limitado }
+    : {
+        res: { ok: false, status: 0 },
+        json: null,
+        text: "tempo da requisição esgotado",
+        limitado,
+      };
 }
 
 // converte timestamp (UTC) para a data em America/Sao_Paulo
@@ -906,6 +924,11 @@ async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, b
   let maisNovoAnterior = null;
   let ordemDesc = null;
   let pagina = 2;
+  // Concorrência ADAPTATIVA: se a API responder 429 (limite de taxa), o bloco é
+  // refeito com metade das chamadas simultâneas, até chegar a 1. Melhor demorar
+  // do que voltar com resultado parcial.
+  let concorrencia = PUSHIN_CONCORRENCIA;
+  let reducoes = 0;
 
   while (!fim && !falha && numeroDePaginaOk && pagina <= teto) {
     if (orc.expired()) {
@@ -918,7 +941,7 @@ async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, b
     }
 
     const bloco = [];
-    for (let p = pagina; p < pagina + PUSHIN_CONCORRENCIA && p <= teto; p++) {
+    for (let p = pagina; p < pagina + concorrencia && p <= teto; p++) {
       bloco.push(p);
     }
 
@@ -926,6 +949,19 @@ async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, b
     const respostas = await Promise.all(
       bloco.map(async (p) => ({ p, r: await abFetch(montaUrl(p), apiKey, orc) }))
     );
+
+    // Duas situações diferentes de limite de taxa:
+    //  - o bloco FALHOU com 429 → reduz e REFAZ (o dedupe protege de duplicar)
+    //  - o bloco só passou porque o abFetch repetiu → reduz para os PRÓXIMOS,
+    //    sem refazer este. Evita as dezenas de chamadas jogadas fora que a
+    //    primeira versão fazia.
+    const falhou429 = respostas.some(({ r }) => r.res.status === 429);
+    const recuperou429 = respostas.some(({ r }) => r.limitado);
+    if ((falhou429 || recuperou429) && concorrencia > 1) {
+      concorrencia = Math.max(1, Math.floor(concorrencia / 2));
+      reducoes++;
+      if (falhou429) continue;
+    }
 
     let maisNovoDoBloco = null;
     for (const { p, r } of respostas) {
@@ -969,7 +1005,18 @@ async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, b
       fim = true;
     }
 
-    pagina += PUSHIN_CONCORRENCIA;
+    // avança pelo tamanho do bloco QUE FOI BUSCADO — usar a concorrência aqui
+    // erra quando ela acabou de ser reduzida, e o bloco seguinte repetiria
+    // páginas já lidas (zero inéditos = a varredura parava achando que acabou)
+    pagina += bloco.length;
+  }
+
+  if (reducoes > 0) {
+    (notas || warnings).push(
+      `PushinPay (${brandLabel}): a API limitou a taxa (HTTP 429) — reduzi de ` +
+        `${PUSHIN_CONCORRENCIA} para ${concorrencia} páginas simultâneas e ` +
+        `terminei a varredura. Se repetir, baixe PUSHIN_CONCURRENCY.`
+    );
   }
 
   // Fallback: a API ignora o número da página. Só resta seguir o cursor, uma de
