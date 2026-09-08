@@ -857,17 +857,17 @@ async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, b
   const ultima = num(p1.json && p1.json.last_page);
   const perPageReportado = num(p1.json && p1.json.per_page);
   const porPagina = perPageReportado || raw1.length;
-  // "página cheia" = provavelmente há mais. Só o tamanho pedido ou o `per_page`
-  // que a API DECLARA servem de régua; deduzir do próprio tamanho da resposta
-  // faria toda página parecer cheia e a paginação nunca terminaria.
-  const pareceCheia = (n) =>
-    n >= Number(PUSHIN_PAGE_LIMIT) ||
-    (perPageReportado > 0 && n >= perPageReportado);
 
   // A API respeitou o tamanho de página pedido? Só faz sentido perguntar quando
   // existe MAIS DE UMA página — página curta porque os dados acabaram é normal,
   // não é a API ignorando o parâmetro.
-  if (ultima > 1 && porPagina > 0 && porPagina < Number(PUSHIN_PAGE_LIMIT)) {
+  if (
+    porPagina > 0 &&
+    porPagina < Number(PUSHIN_PAGE_LIMIT) &&
+    // só faz sentido quando HÁ mais de uma página: resposta curta porque os
+    // dados acabaram é normal, não é a API ignorando o parâmetro
+    (ultima > 1 || (p1.json && (p1.json.next_page_url || p1.json.links?.next)))
+  ) {
     warnings.push(
       `PushinPay (${brandLabel}): pedi ${PUSHIN_PAGE_LIMIT} registros por página ` +
         `e a API devolveu ${porPagina}` +
@@ -878,139 +878,137 @@ async function fetchPushinTransactions(apiKey, from, to, warnings, brandLabel, b
   }
 
   // ---------- páginas 2..N ----------
-  if (ultima > 1) {
-    // O paginador diz quantas páginas existem: dá para buscar em paralelo em
-    // vez de uma de cada vez. É isto que faz caber no tempo.
-    const teto = Math.min(ultima, PUSHIN_MAX_PAGES);
-    if (ultima > PUSHIN_MAX_PAGES) truncated = true;
+  // A API NÃO devolve `last_page` nem `total` — é o simplePaginate do Laravel
+  // (só current_page, per_page e next_page_url). Sem saber quantas páginas
+  // existem, a única forma de paralelizar é ESPECULAR: pedir um bloco de
+  // páginas seguintes de uma vez e parar quando uma delas vier curta.
+  // Régua de "página cheia". Se a API não DECLARA o `per_page`, a única régua
+  // honesta é o que foi pedido — deduzir do tamanho da própria resposta faria
+  // toda página parecer cheia e a paginação nunca terminaria.
+  const tamanhoPagina = perPageReportado || Number(PUSHIN_PAGE_LIMIT);
+  const teto = ultima > 0 ? Math.min(ultima, PUSHIN_MAX_PAGES) : PUSHIN_MAX_PAGES;
+  if (ultima > PUSHIN_MAX_PAGES) truncated = true;
 
-    // Em BLOCOS do tamanho da concorrência: rápido como o paralelo, mas ainda
-    // dá para parar entre um bloco e outro. Sem isso, uma API que ignora o
-    // filtro de data faria a gente baixar o histórico inteiro de uma vez.
-    let maisNovoAnterior = null;
-    let ordemDesc = null;
+  // "Ainda tem página?" — o que a API DIZ vale mais que o tamanho da resposta.
+  // Uma página curta só significa fim quando não há cursor nem last_page.
+  const temMais = (json, p, raw) => {
+    if (json && (json.next_page_url || json.links?.next)) return true;
+    const cur = num(json && json.current_page) || p;
+    const ult = num(json && json.last_page);
+    if (ult) return cur < ult;
+    return raw.length >= tamanhoPagina;
+  };
 
-    for (let inicio = 2; inicio <= teto; inicio += PUSHIN_CONCORRENCIA) {
-      if (orc.expired() || falha) break;
-      const bloco = [];
-      for (let p = inicio; p < inicio + PUSHIN_CONCORRENCIA && p <= teto; p++) {
-        bloco.push(p);
-      }
+  let fim = !temMais(p1.json, 1, raw1);
+  let numeroDePaginaOk = true;
+  let maisNovoAnterior = null;
+  let ordemDesc = null;
+  let pagina = 2;
 
-      let maisNovoDoBloco = null;
-      await Promise.all(
-        bloco.map(async (p) => {
-          if (orc.expired() || falha) return;
-          const r = await abFetch(montaUrl(p), apiKey, orc);
-          if (!r.res.ok) {
-            falha = falha || {
-              pagina: p,
-              detalhe: r.res.status === 0 ? String(r.text) : `HTTP ${r.res.status}`,
-            };
-            return;
-          }
-          const raw = extrai(r.json);
-          for (const it of raw) {
-            const d = toLocalDate(it.created_at || it.createdAt);
-            if (d && (maisNovoDoBloco === null || d > maisNovoDoBloco)) {
-              maisNovoDoBloco = d;
-            }
-          }
-          processa(raw);
-        })
-      );
-
-      if (ordemDesc === null && maisNovoAnterior && maisNovoDoBloco && maisNovoDoBloco !== maisNovoAnterior) {
-        ordemDesc = maisNovoDoBloco < maisNovoAnterior;
-      }
-      if (maisNovoDoBloco) maisNovoAnterior = maisNovoDoBloco;
-
-      // bloco inteiro antes do início do período e a listagem é decrescente:
-      // o resto é mais antigo ainda, não há o que buscar
-      if (ordemDesc && from && maisNovoDoBloco && maisNovoDoBloco < from) {
-        truncated = false;
-        break;
-      }
-    }
-
-    if (falha) {
-      return encerra(
-        `parou na página ${falha.pagina} de ${teto} (${falha.detalhe}) — ` +
-          `${lidos} registros lidos, ${out.length} pagos no período. ` +
-          `Resultado PARCIAL.`
-      );
-    }
+  while (!fim && !falha && numeroDePaginaOk && pagina <= teto) {
     if (orc.expired()) {
       return encerra(
-        `estourou o tempo da fonte (${Math.round(PUSHIN_BUDGET_MS / 1000)}s) — ` +
-          `${lidos} de ${total || "?"} registros lidos, ${out.length} pagos no ` +
+        `estourou o tempo da fonte (${Math.round(PUSHIN_BUDGET_MS / 1000)}s) na ` +
+          `página ${pagina} — ${lidos} registros lidos, ${out.length} pagos no ` +
           `período. Resultado PARCIAL. Suba PUSHIN_BUDGET_MS ou ` +
           `PUSHIN_CONCURRENCY (hoje ${PUSHIN_CONCORRENCIA}).`
       );
     }
-  } else {
-    // Sem `last_page`: cai no modo antigo, seguindo cursor/número de página,
-    // com parada antecipada quando a listagem passa do início do período.
-    let nextUrl = (p1.json && (p1.json.next_page_url || p1.json.links?.next)) || null;
-    let ordemDesc = null;
-    let maisNovoAnterior = null;
-    let ultimoTamanho = raw1.length;
-    truncated = true;
 
-    for (let pagina = 2; pagina <= PUSHIN_MAX_PAGES; pagina++) {
-      if (orc.expired()) {
-        return encerra(
-          `estourou o tempo da fonte na página ${pagina} — ${lidos} registros ` +
-            `lidos, ${out.length} pagos no período. Resultado PARCIAL.`
-        );
+    const bloco = [];
+    for (let p = pagina; p < pagina + PUSHIN_CONCORRENCIA && p <= teto; p++) {
+      bloco.push(p);
+    }
+
+    // busca o bloco inteiro de uma vez; processa na ORDEM das páginas
+    const respostas = await Promise.all(
+      bloco.map(async (p) => ({ p, r: await abFetch(montaUrl(p), apiKey, orc) }))
+    );
+
+    let maisNovoDoBloco = null;
+    for (const { p, r } of respostas) {
+      if (!r.res.ok) {
+        falha = {
+          pagina: p,
+          detalhe: r.res.status === 0 ? String(r.text) : `HTTP ${r.res.status}`,
+        };
+        break;
       }
-      if (!nextUrl && !pareceCheia(pagina === 2 ? raw1.length : ultimoTamanho)) {
-        truncated = false;
+      // A API respeitou o número da página que pedi? Se devolver sempre a
+      // mesma, especular é inútil e o cursor é o único caminho.
+      const cur = num(r.json && r.json.current_page);
+      if (cur && cur !== p) {
+        numeroDePaginaOk = false;
         break;
       }
 
-      const r = await abFetch(nextUrl || montaUrl(pagina), apiKey, orc);
+      const raw = extrai(r.json);
+      for (const it of raw) {
+        const d = toLocalDate(it.created_at || it.createdAt);
+        if (d && (maisNovoDoBloco === null || d > maisNovoDoBloco)) {
+          maisNovoDoBloco = d;
+        }
+      }
+      const novos = processa(raw);
+      // fim da listagem, ou paginação que não anda (zero registros inéditos)
+      if (!temMais(r.json, p, raw) || novos === 0) {
+        fim = true;
+        break;
+      }
+    }
+
+    if (ordemDesc === null && maisNovoAnterior && maisNovoDoBloco && maisNovoDoBloco !== maisNovoAnterior) {
+      ordemDesc = maisNovoDoBloco < maisNovoAnterior;
+    }
+    if (maisNovoDoBloco) maisNovoAnterior = maisNovoDoBloco;
+
+    // bloco inteiro anterior ao período, e a listagem é decrescente: acabou
+    if (ordemDesc && from && maisNovoDoBloco && maisNovoDoBloco < from) {
+      fim = true;
+    }
+
+    pagina += PUSHIN_CONCORRENCIA;
+  }
+
+  // Fallback: a API ignora o número da página. Só resta seguir o cursor, uma de
+  // cada vez. O dedupe por id garante que reler as primeiras não duplica nada.
+  if (!numeroDePaginaOk) {
+    warnings.push(
+      `PushinPay (${brandLabel}): a API não respeita o número da página — ` +
+        `seguindo pelo cursor, uma de cada vez (mais lento).`
+    );
+    let nextUrl =
+      (p1.json && (p1.json.next_page_url || p1.json.links?.next)) || null;
+    for (let n = 2; nextUrl && n <= PUSHIN_MAX_PAGES; n++) {
+      if (orc.expired()) {
+        return encerra(
+          `estourou o tempo da fonte na página ${n} — ${lidos} registros lidos, ` +
+            `${out.length} pagos no período. Resultado PARCIAL.`
+        );
+      }
+      const r = await abFetch(nextUrl, apiKey, orc);
       if (!r.res.ok) {
         const detalhe =
           r.res.status === 0 ? String(r.text) : `HTTP ${r.res.status}`;
         return encerra(
-          `parou na página ${pagina} (${detalhe}) — ${lidos} registros lidos, ` +
+          `parou na página ${n} (${detalhe}) — ${lidos} registros lidos, ` +
             `${out.length} pagos no período. Resultado PARCIAL.`
         );
       }
       const raw = extrai(r.json);
-      ultimoTamanho = raw.length;
-      const datas = raw
-        .map((x) => toLocalDate(x.created_at || x.createdAt))
-        .filter(Boolean);
       const novos = processa(raw);
-
-      const maisNovo = datas.length ? datas.reduce((a, c) => (c > a ? c : a)) : null;
-      if (ordemDesc === null && datas.length > 1) {
-        const pri = datas[0];
-        const ult = datas[datas.length - 1];
-        if (pri !== ult) ordemDesc = pri > ult;
-      }
-      if (ordemDesc === null && maisNovoAnterior && maisNovo && maisNovo !== maisNovoAnterior) {
-        ordemDesc = maisNovo < maisNovoAnterior;
-      }
-      if (maisNovo) maisNovoAnterior = maisNovo;
-
-      if (novos === 0) {
-        truncated = false;
-        break;
-      }
-      // parada antecipada: a listagem passou do início do período
-      if (ordemDesc && from && maisNovo && maisNovo < from) {
-        truncated = false;
-        break;
-      }
+      if (novos === 0 || !temMais(r.json, n, raw)) break;
       nextUrl = (r.json && (r.json.next_page_url || r.json.links?.next)) || null;
-      if (!nextUrl && !pareceCheia(raw.length)) {
-        truncated = false;
-        break;
-      }
+      if (!nextUrl) break;
     }
+  } else if (falha) {
+    return encerra(
+      `parou na página ${falha.pagina}${ultima ? ` de ${ultima}` : ""} ` +
+        `(${falha.detalhe}) — ${lidos} registros lidos, ${out.length} pagos no ` +
+        `período. Resultado PARCIAL.`
+    );
+  } else if (!fim && pagina > teto) {
+    truncated = true;
   }
 
   if (foraDaJanela > 0) {
