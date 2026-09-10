@@ -131,6 +131,18 @@ const DB_PAID_VIEW = process.env.DB_PAID_VIEW || REPEAT_VIEW;
 // Valor em centavos no banco? Não adivinho: o ?debug=fontes mostra a razão
 // entre banco e API e diz se isto precisa virar 100.
 const DB_AMOUNT_DIVISOR = Number(process.env.DB_AMOUNT_DIVISOR) || 1;
+// Funil criadas x pagas: a view de pagas não serve (só tem as pagas). Vem da
+// tabela base, a mesma que os fluxos de e-mail já leem direto.
+const DB_TX_TABLE = process.env.DB_TX_TABLE || "public.transactions";
+const DB_PAID_STATUSES = (process.env.DB_PAID_STATUSES || "paid,approved")
+  .split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+// Estornadas não são "cobrança não convertida" — elas converteram e voltaram.
+// Ficam fora dos dois lados do funil, igual à regra usada no Abacate.
+const DB_IGNORED_STATUSES = (process.env.DB_IGNORED_STATUSES || "refunded,chargeback")
+  .split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+// As colunas de data do banco guardam UTC cru (padrão do Prisma), menos as que
+// terminam em "Br". Sem converter, venda da madrugada cai no dia errado.
+const DB_TZ_CONVERTE = (process.env.DB_TX_TZ || "utc").toLowerCase() !== "none";
 const repeatCache = new Map(); // lookback -> { at, payload }
 
 // Cache em memória (por instância warm da função)
@@ -1348,6 +1360,14 @@ const PREF_DATA_RECEITA = [
   "paidatbr", "paid_at_br", "paidat", "paid_at", "paymentdate", "payment_date",
   "data_pagamento", "createdat", "created_at",
 ];
+// Expressão de data já em horário de Brasília. Coluna que termina em "Br" já
+// vem convertida; o resto é UTC cru e precisa da conversão.
+function exprData(col) {
+  const q = qIdent(col);
+  if (!DB_TZ_CONVERTE || /br$/i.test(col)) return `${q}::timestamp`;
+  return `((${q}::timestamp AT TIME ZONE 'UTC') AT TIME ZONE 'America/Sao_Paulo')`;
+}
+
 function escolheColunasReceita(cols) {
   const nomes = cols.map((c) => c.column_name);
   const tipo = Object.fromEntries(cols.map((c) => [c.column_name, c.data_type]));
@@ -1393,14 +1413,20 @@ function escolheColunasReceita(cols) {
     acha(/^(brand|marca|product|produto|tenant|site|dominio|domain)$/i) ||
     null;
 
-  return { data, valor, colGateway, colMetadata, gateway, colMarca };
+  const status =
+    (process.env.DB_STATUS_COL && nomes.includes(process.env.DB_STATUS_COL) && process.env.DB_STATUS_COL) ||
+    acha(/^(status|payment_status|paymentstatus|situacao)$/i) ||
+    acha(/status/i) ||
+    null;
+
+  return { data, valor, colGateway, colMetadata, gateway, colMarca, status };
 }
 
 // Receita por dia x gateway x marca, direto do banco. Uma varredura, sem
 // paginação, sem rate limit.
 function buildReceitaSql(view, c) {
   const { schema, table } = splitView(view);
-  const D = qIdent(c.data);
+  const D = exprData(c.data);
   const V = qIdent(c.valor);
   const M = c.colMarca ? qIdent(c.colMarca) : "NULL";
   return `
@@ -1415,6 +1441,27 @@ WHERE ${D} IS NOT NULL
   AND ${D}::timestamp <  ($2::date + 1)::timestamp
 GROUP BY 1, 2, 3
 ORDER BY 1;`;
+}
+
+// Funil criadas x pagas, direto da tabela base. Conta pela data de CRIAÇÃO,
+// dos dois lados — mesma coorte que o funil das APIs usava.
+function buildFunilSql(tabela, c) {
+  const { schema, table } = splitView(tabela);
+  const D = exprData(c.data);
+  const ST = `lower(COALESCE(${qIdent(c.status)}::text, ''))`;
+  const M = c.colMarca ? qIdent(c.colMarca) : "NULL";
+  return `
+SELECT to_char(${D}, 'YYYY-MM-DD')                       AS dia,
+       COALESCE(NULLIF(${c.gateway}, ''), 'desconhecido') AS gateway,
+       ${M}                                              AS marca,
+       count(*)                                          AS criadas,
+       count(*) FILTER (WHERE ${ST} = ANY($3::text[]))    AS pagas
+FROM ${qIdent(schema)}.${qIdent(table)}
+WHERE ${qIdent(c.data)} IS NOT NULL
+  AND ${D} >= $1::timestamp
+  AND ${D} <  ($2::date + 1)::timestamp
+  AND NOT (${ST} = ANY($4::text[]))
+GROUP BY 1, 2, 3;`;
 }
 
 // Uma varredura só. O `pares` casa cada compra com as compras seguintes DO
@@ -1659,6 +1706,50 @@ async function fetchReceitaDoBanco(from, to, nomes) {
   });
 }
 
+// Funil criadas x pagas a partir da tabela base. Devolve o mesmo formato do
+// `bumpFunnel`: { source, date, created, paid } por marca.
+async function fetchFunilDoBanco(from, to, nomes) {
+  return comCliente(async (client) => {
+    const cols = await lerColunas(client, DB_TX_TABLE);
+    const c = escolheColunasReceita(cols);
+    // aqui a data certa é a de CRIAÇÃO, não a de pagamento
+    const nomesCols = cols.map((x) => x.column_name);
+    const criacao =
+      (process.env.DB_TX_DATE_COL && nomesCols.includes(process.env.DB_TX_DATE_COL) && process.env.DB_TX_DATE_COL) ||
+      ["createdatbr", "created_at_br", "createdat", "created_at", "data_criacao"]
+        .map((pref) => nomesCols.find((n) => n.toLowerCase() === pref))
+        .find(Boolean) ||
+      c.data;
+    if (!criacao || !c.status) {
+      throw new Error(
+        `não achei coluna de ${!criacao ? "data de criação" : "status"} em ` +
+          `${DB_TX_TABLE}. Colunas: ${nomesCols.join(", ")}. ` +
+          `Defina DB_TX_DATE_COL / DB_STATUS_COL.`
+      );
+    }
+    const { rows } = await client.query(
+      buildFunilSql(DB_TX_TABLE, { ...c, data: criacao }),
+      [from, to, DB_PAID_STATUSES, DB_IGNORED_STATUSES]
+    );
+
+    const porMarca = Object.fromEntries(nomes.map((n) => [n, []]));
+    for (const r of rows) {
+      const marcaBruta = r.marca == null ? null : String(r.marca);
+      const alvo =
+        (marcaBruta && /placa/i.test(marcaBruta) ? nomes[1] : null) ||
+        (marcaBruta && /processo/i.test(marcaBruta) ? nomes[0] : null) ||
+        nomes[0];
+      porMarca[alvo].push({
+        source: rotuloGateway(r.gateway),
+        date: String(r.dia),
+        created: num(r.criadas),
+        paid: num(r.pagas),
+      });
+    }
+    return { colunas: { data: criacao, status: c.status }, porMarca, linhas: rows.length };
+  });
+}
+
 // GET /api/dashboard?debug=fontes — banco x API lado a lado, mesmo período.
 // É a conferência que decide se dá para virar a chave REVENUE_SOURCE=db.
 async function debugFontes(from, to, nomes) {
@@ -1686,8 +1777,9 @@ async function debugFontes(from, to, nomes) {
   };
 
   const lixo = [];
-  const [banco, abProc, abPlaca, stProc, stPlaca, pxProc, pxPlaca] = await Promise.all([
+  const [banco, funil, abProc, abPlaca, stProc, stPlaca, pxProc, pxPlaca] = await Promise.all([
     fetchReceitaDoBanco(from, to, nomes).catch((e) => ({ erro: String(e?.message || e) })),
+    fetchFunilDoBanco(from, to, nomes).catch((e) => ({ erro: String(e?.message || e) })),
     fetchAbacateTransactions(process.env.ABACATE_KEY_PROCESSO, from, to, lixo, "Processo", budget).catch(() => []),
     fetchAbacateTransactions(process.env.ABACATE_KEY_PLACA, from, to, lixo, "Placa", budget).catch(() => []),
     fetchStripeTransactions(process.env.STRIPE_KEY_PROCESSO, from, to, lixo, "Processo", budget).catch(() => []),
@@ -1713,6 +1805,16 @@ async function debugFontes(from, to, nomes) {
           marcasVistas: banco.marcasVistas,
           totais: { receita: Number(bd.receita.toFixed(2)), transacoes: bd.transacoes },
           porFonte: porFonte(bancoTx),
+        },
+    funil: funil.erro
+      ? { tabela: DB_TX_TABLE, erro: funil.erro }
+      : {
+          tabela: DB_TX_TABLE,
+          colunasDetectadas: funil.colunas,
+          statusQueContamComoPago: DB_PAID_STATUSES,
+          statusIgnorados: DB_IGNORED_STATUSES,
+          criadas: Object.values(funil.porMarca).flat().reduce((a, f) => a + f.created, 0),
+          pagas: Object.values(funil.porMarca).flat().reduce((a, f) => a + f.paid, 0),
         },
     api: {
       totais: { receita: Number(api.receita.toFixed(2)), transacoes: api.transacoes },
@@ -2031,6 +2133,27 @@ export async function GET(request) {
       );
     } catch (e) {
       errors.push(`Banco (receita): ${e?.message || e}`);
+    }
+
+    // funil criadas x pagas: a view de pagas não tem as não pagas, então vem
+    // da tabela base. Falha aqui não derruba a receita — só apaga a conversão.
+    try {
+      const fn = await fetchFunilDoBanco(from, to, [nameProcesso, namePlaca]);
+      funnelProcesso.clear();
+      funnelPlaca.clear();
+      for (const [marca, mapa] of [
+        [nameProcesso, funnelProcesso],
+        [namePlaca, funnelPlaca],
+      ]) {
+        for (const f of fn.porMarca[marca] || []) {
+          mapa.set(`${f.source}|${f.date}`, f);
+        }
+      }
+    } catch (e) {
+      warnings.push(
+        `Banco (funil criadas x pagas): ${e?.message || e} — a conversão fica ` +
+          `sem dados; receita e transações não são afetadas.`
+      );
     }
   }
 
