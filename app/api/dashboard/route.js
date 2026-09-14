@@ -176,6 +176,18 @@ function shiftDays(dateStr, days) {
   return d.toLocaleDateString("en-CA", { timeZone: TZ });
 }
 
+// Mesma data, um mês atrás. Dia que não existe no mês anterior encosta no
+// último (31/03 -> 28/02), senão a comparação pularia para março.
+function mesAnterior(dateStr) {
+  const [y, m, d] = String(dateStr).split("-").map(Number);
+  if (!y || !m || !d) return dateStr;
+  const ano = m === 1 ? y - 1 : y;
+  const mes = m === 1 ? 12 : m - 1;
+  const ultimo = new Date(Date.UTC(ano, mes, 0)).getUTCDate();
+  const dia = Math.min(d, ultimo);
+  return `${ano}-${String(mes).padStart(2, "0")}-${String(dia).padStart(2, "0")}`;
+}
+
 function inRange(dateStr, from, to) {
   if (!dateStr) return false;
   return dateStr >= from && dateStr <= to;
@@ -1424,13 +1436,14 @@ function escolheColunasReceita(cols) {
 
 // Receita por dia x gateway x marca, direto do banco. Uma varredura, sem
 // paginação, sem rate limit.
-function buildReceitaSql(view, c) {
+function buildReceitaSql(view, c, gran = "dia") {
+  const fmt = gran === "mes" ? "YYYY-MM" : "YYYY-MM-DD";
   const { schema, table } = splitView(view);
   const D = exprData(c.data);
   const V = qIdent(c.valor);
   const M = c.colMarca ? qIdent(c.colMarca) : "NULL";
   return `
-SELECT to_char(${D}::timestamp, 'YYYY-MM-DD')          AS dia,
+SELECT to_char(${D}, '${fmt}')                          AS dia,
        COALESCE(NULLIF(${c.gateway}, ''), 'desconhecido') AS gateway,
        ${M}                                            AS marca,
        count(*)                                        AS transacoes,
@@ -1445,13 +1458,14 @@ ORDER BY 1;`;
 
 // Funil criadas x pagas, direto da tabela base. Conta pela data de CRIAÇÃO,
 // dos dois lados — mesma coorte que o funil das APIs usava.
-function buildFunilSql(tabela, c) {
+function buildFunilSql(tabela, c, gran = "dia") {
+  const fmt = gran === "mes" ? "YYYY-MM" : "YYYY-MM-DD";
   const { schema, table } = splitView(tabela);
   const D = exprData(c.data);
   const ST = `lower(COALESCE(${qIdent(c.status)}::text, ''))`;
   const M = c.colMarca ? qIdent(c.colMarca) : "NULL";
   return `
-SELECT to_char(${D}, 'YYYY-MM-DD')                       AS dia,
+SELECT to_char(${D}, '${fmt}')                           AS dia,
        COALESCE(NULLIF(${c.gateway}, ''), 'desconhecido') AS gateway,
        ${M}                                              AS marca,
        count(*)                                          AS criadas,
@@ -1660,7 +1674,7 @@ function rotuloGateway(v) {
 
 // Lê a receita do banco e devolve no MESMO formato das APIs
 // ({ amount, date, source }), agrupada por marca.
-async function fetchReceitaDoBanco(from, to, nomes) {
+async function fetchReceitaDoBanco(from, to, nomes, gran = "dia") {
   return comCliente(async (client) => {
     const cols = await lerColunas(client, DB_PAID_VIEW);
     const c = escolheColunasReceita(cols);
@@ -1671,7 +1685,7 @@ async function fetchReceitaDoBanco(from, to, nomes) {
           `Defina DB_DATE_COL / DB_AMOUNT_COL.`
       );
     }
-    const { rows } = await client.query(buildReceitaSql(DB_PAID_VIEW, c), [from, to]);
+    const { rows } = await client.query(buildReceitaSql(DB_PAID_VIEW, c, gran), [from, to]);
 
     // marca: se a view não distingue, tudo vai para a primeira e isso é dito
     // em voz alta — número de marca errado é pior que número ausente.
@@ -1708,7 +1722,7 @@ async function fetchReceitaDoBanco(from, to, nomes) {
 
 // Funil criadas x pagas a partir da tabela base. Devolve o mesmo formato do
 // `bumpFunnel`: { source, date, created, paid } por marca.
-async function fetchFunilDoBanco(from, to, nomes) {
+async function fetchFunilDoBanco(from, to, nomes, gran = "dia") {
   return comCliente(async (client) => {
     const cols = await lerColunas(client, DB_TX_TABLE);
     const c = escolheColunasReceita(cols);
@@ -1728,7 +1742,7 @@ async function fetchFunilDoBanco(from, to, nomes) {
       );
     }
     const { rows } = await client.query(
-      buildFunilSql(DB_TX_TABLE, { ...c, data: criacao }),
+      buildFunilSql(DB_TX_TABLE, { ...c, data: criacao }, gran),
       [from, to, DB_PAID_STATUSES, DB_IGNORED_STATUSES]
     );
 
@@ -1748,6 +1762,67 @@ async function fetchFunilDoBanco(from, to, nomes) {
     }
     return { colunas: { data: criacao, status: c.status }, porMarca, linhas: rows.length };
   });
+}
+
+// Números agregados de um período, só para comparar — sem série diária, sem
+// gráfico. Só existe no modo `db`: no modo `api` isso dobraria a raspagem.
+async function resumoDoPeriodo(from, to, nomes) {
+  const budget = makeBudget(25000);
+  const settle = (p) => p.then((v) => v, () => null);
+  const [gads, receita, funil] = await Promise.all([
+    settle(fetchGoogleAds(from, to, budget)),
+    settle(fetchReceitaDoBanco(from, to, nomes)),
+    settle(fetchFunilDoBanco(from, to, nomes)),
+  ]);
+
+  const vazio = () => ({
+    spend: 0, revenue: 0, transactions: 0, created: 0, convPaid: 0,
+  });
+  const porMarca = Object.fromEntries(nomes.map((n) => [n, vazio()]));
+
+  for (const r of gads || []) {
+    const nome = String(r.account_name || "").trim();
+    if (!porMarca[nome]) continue;
+    const d = String(r.date).slice(0, 10);
+    if (!inRange(d, from, to)) continue;
+    porMarca[nome].spend += num(r.spend);
+  }
+  for (const nome of nomes) {
+    for (const t of (receita && receita.porMarca[nome]) || []) {
+      if (!inRange(t.date, from, to)) continue;
+      porMarca[nome].revenue += t.amount;
+      porMarca[nome].transactions += num(t.count) || 1;
+    }
+    for (const f of (funil && funil.porMarca[nome]) || []) {
+      if (!inRange(f.date, from, to)) continue;
+      porMarca[nome].created += f.created;
+      porMarca[nome].convPaid += f.paid;
+    }
+  }
+
+  const derivado = (b) => ({
+    ...b,
+    takeRate: b.revenue - b.spend,
+    ticket: b.transactions > 0 ? b.revenue / b.transactions : null,
+    cpa: b.transactions > 0 ? b.spend / b.transactions : null,
+    roas: b.spend > 0 ? b.revenue / b.spend : null,
+    conversion: b.created > 0 ? b.convPaid / b.created : null,
+  });
+
+  const total = vazio();
+  for (const nome of nomes) {
+    total.spend += porMarca[nome].spend;
+    total.revenue += porMarca[nome].revenue;
+    total.transactions += porMarca[nome].transactions;
+    total.created += porMarca[nome].created;
+    total.convPaid += porMarca[nome].convPaid;
+  }
+
+  return {
+    periodo: { from, to },
+    porMarca: Object.fromEntries(nomes.map((n) => [n, derivado(porMarca[n])])),
+    total: derivado(total),
+  };
 }
 
 // GET /api/dashboard?debug=fontes — banco x API lado a lado, mesmo período.
@@ -1852,6 +1927,108 @@ async function debugFontes(from, to, nomes) {
   };
 }
 
+// GET /api/dashboard?mensal=1  (&meses=12)
+// Tabela mês a mês. Rota separada da principal: é outro recorte de tempo e o
+// frontend busca em paralelo, sem segurar a tela.
+const mensalCache = new Map();
+async function handleMensal(searchParams) {
+  if (REVENUE_SOURCE !== "db") {
+    return NextResponse.json(
+      {
+        erro:
+          "a tabela mês a mês precisa de REVENUE_SOURCE=db — pelas APIs de " +
+          "gateway seriam milhares de páginas por mês.",
+      },
+      { status: 400, headers: { "Cache-Control": "no-store" } }
+    );
+  }
+
+  const meses = Math.min(36, Math.max(1, Number(searchParams.get("meses")) || 12));
+  const force = searchParams.get("refresh") === "1";
+  const hoje = todayISO();
+  const [y, m] = hoje.split("-").map(Number);
+  // primeiro dia do mês, `meses-1` meses atrás
+  const inicio = new Date(Date.UTC(y, m - 1 - (meses - 1), 1))
+    .toISOString()
+    .slice(0, 10);
+
+  const chave = `${inicio}:${hoje}`;
+  const hit = mensalCache.get(chave);
+  if (!force && hit && Date.now() - hit.at < 10 * 60 * 1000) {
+    return NextResponse.json({ ...hit.payload, cached: true });
+  }
+
+  const nomes = [
+    process.env.GADS_ACCOUNT_PROCESSO || "Verifica Processo",
+    process.env.GADS_ACCOUNT_PLACA || "Verifica Placa",
+  ];
+
+  try {
+    const budget = makeBudget(40000);
+    const settle = (p) => p.then((v) => v, () => null);
+    const [gads, receita, funil] = await Promise.all([
+      settle(fetchGoogleAds(inicio, hoje, budget)),
+      fetchReceitaDoBanco(inicio, hoje, nomes, "mes"),
+      settle(fetchFunilDoBanco(inicio, hoje, nomes, "mes")),
+    ]);
+
+    const porMes = new Map();
+    const linha = (mes) => {
+      if (!porMes.has(mes)) {
+        porMes.set(mes, {
+          mes, spend: 0, revenue: 0, transactions: 0, created: 0, convPaid: 0,
+        });
+      }
+      return porMes.get(mes);
+    };
+
+    for (const r of gads || []) {
+      const mes = String(r.date).slice(0, 7);
+      if (mes < inicio.slice(0, 7)) continue;
+      linha(mes).spend += num(r.spend);
+    }
+    for (const nome of nomes) {
+      for (const t of receita.porMarca[nome] || []) {
+        const l = linha(t.date);
+        l.revenue += t.amount;
+        l.transactions += num(t.count) || 1;
+      }
+      for (const f of (funil && funil.porMarca[nome]) || []) {
+        const l = linha(f.date);
+        l.created += f.created;
+        l.convPaid += f.paid;
+      }
+    }
+
+    const linhas = [...porMes.values()]
+      .sort((a, b) => (a.mes < b.mes ? 1 : -1))
+      .map((l) => ({
+        ...l,
+        takeRate: l.revenue - l.spend,
+        ticket: l.transactions > 0 ? l.revenue / l.transactions : null,
+        cpa: l.transactions > 0 ? l.spend / l.transactions : null,
+        roas: l.spend > 0 ? l.revenue / l.spend : null,
+        conversion: l.created > 0 ? l.convPaid / l.created : null,
+      }));
+
+    const payload = {
+      de: inicio,
+      ate: hoje,
+      // o mês corrente está incompleto — dizer isso evita ler queda onde não há
+      mesIncompleto: hoje.slice(0, 7),
+      semFunil: !funil,
+      linhas,
+    };
+    mensalCache.set(chave, { at: Date.now(), payload });
+    return NextResponse.json(payload, { headers: { "Cache-Control": "no-store" } });
+  } catch (e) {
+    return NextResponse.json(
+      { erro: String(e?.message || e) },
+      { status: 500, headers: { "Cache-Control": "no-store" } }
+    );
+  }
+}
+
 // GET /api/dashboard?repeat=1  (&dias=730, &debug=1, &refresh=1)
 async function handleRepeat(searchParams) {
   const debug = searchParams.get("debug") === "1";
@@ -1929,6 +2106,9 @@ export async function GET(request) {
 
   // /api/dashboard?repeat=1 — recompra por e-mail, lida do Postgres
   if (searchParams.get("repeat") === "1") return handleRepeat(searchParams);
+
+  // /api/dashboard?mensal=1 — tabela mês a mês
+  if (searchParams.get("mensal") === "1") return handleMensal(searchParams);
 
   // /api/dashboard?debug=fontes — banco x API, para decidir a migração
   if (searchParams.get("debug") === "fontes") {
@@ -2222,8 +2402,30 @@ export async function GET(request) {
     sources: Object.values(mergedSources).sort((a, b) => b.revenue - a.revenue),
   };
 
+  // comparativo com o mesmo período do mês anterior
+  let anterior = null;
+  if (usandoBanco && searchParams.get("comparar") !== "0") {
+    const fromAnt = mesAnterior(from);
+    const toAnt = mesAnterior(to);
+    try {
+      const r = await resumoDoPeriodo(fromAnt, toAnt, [nameProcesso, namePlaca]);
+      anterior = r;
+      total.anterior = r.total;
+      brands[0].anterior = r.porMarca[nameProcesso];
+      brands[1].anterior = r.porMarca[namePlaca];
+    } catch (e) {
+      notas.push(`Comparativo com ${fromAnt}..${toAnt} indisponível: ${e?.message || e}`);
+    }
+  } else if (!usandoBanco) {
+    notas.push(
+      "Comparativo com o mês anterior só existe no modo REVENUE_SOURCE=db — " +
+        "no modo api ele dobraria a raspagem das páginas."
+    );
+  }
+
   const payload = {
     period: { from, to },
+    previousPeriod: anterior ? anterior.periodo : null,
     updatedAt: new Date().toISOString(),
     total,
     brands,
