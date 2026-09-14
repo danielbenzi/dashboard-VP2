@@ -24,6 +24,28 @@ function fmtRoas(v) {
   if (v == null || !Number.isFinite(v)) return "—";
   return v.toFixed(2) + "x";
 }
+// variação vs período anterior. `melhorQuando` diz para que lado é bom:
+// "maior" (receita, ROAS), "menor" (CPA) ou null (gasto — nem bom nem ruim).
+function Delta({ atual, anterior, melhorQuando }) {
+  if (
+    atual == null || anterior == null ||
+    !Number.isFinite(atual) || !Number.isFinite(anterior) || anterior === 0
+  ) {
+    return null;
+  }
+  const variacao = (atual - anterior) / Math.abs(anterior);
+  if (!Number.isFinite(variacao)) return null;
+  const subiu = variacao > 0;
+  const bom = melhorQuando === "maior" ? subiu : melhorQuando === "menor" ? !subiu : null;
+  const cor = bom == null ? "var(--muted)" : bom ? "var(--green)" : "var(--red)";
+  return (
+    <div className="sub" style={{ color: cor }}>
+      {subiu ? "▲" : "▼"} {Math.abs(variacao * 100).toFixed(1).replace(".", ",")}%
+      <span style={{ color: "var(--muted)" }}> vs mês passado</span>
+    </div>
+  );
+}
+
 function fmtDate(d) {
   return `${d.slice(8, 10)}/${d.slice(5, 7)}`;
 }
@@ -211,10 +233,106 @@ export default function Page() {
             color="var(--placa)"
             title={data.brands[1].name}
           />
+          <MonthlySection />
           <RepeatSection />
         </>
       )}
     </div>
+  );
+}
+
+// Tabela mês a mês. Rota separada (?mensal=1), buscada em paralelo.
+function MonthlySection() {
+  const [d, setD] = useState(null);
+  const [err, setErr] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let vivo = true;
+    fetch("/api/dashboard?mensal=1&meses=12", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((j) => {
+        if (!vivo) return;
+        if (j.erro) setErr(j.erro);
+        else setD(j);
+      })
+      .catch((e) => vivo && setErr(e.message))
+      .finally(() => vivo && setLoading(false));
+    return () => {
+      vivo = false;
+    };
+  }, []);
+
+  const fmtMes = (m) => {
+    const [y, mm] = m.split("-");
+    const nomes = ["jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"];
+    return `${nomes[Number(mm) - 1]}/${y.slice(2)}`;
+  };
+
+  return (
+    <>
+      <div className="section-title">
+        <span className="dot" style={{ background: "#c9d4e8" }} />
+        Mês a mês
+      </div>
+
+      {loading && <div className="table-card loading">Carregando…</div>}
+      {err && <div className="banner">Mês a mês indisponível: {err}</div>}
+
+      {d && (
+        <div className="table-card">
+          <div className="legend" style={{ display: "block", lineHeight: 1.5 }}>
+            <strong style={{ color: "var(--text)" }}>Todos os meses</strong>
+            <div style={{ marginTop: 4 }}>
+              O mês corrente ({fmtMes(d.mesIncompleto)}) está <strong>incompleto</strong> —
+              não leia como queda.
+              {d.semFunil && " O funil não respondeu; criadas e conversão ficam em —."}
+            </div>
+          </div>
+          <div className="table-scroll">
+            <table className="day-table">
+              <thead>
+                <tr>
+                  <th>Mês</th>
+                  <th>Gasto</th>
+                  <th>Receita</th>
+                  <th>Take rate</th>
+                  <th>Transações</th>
+                  <th>Ticket</th>
+                  <th>CPA</th>
+                  <th>ROAS</th>
+                  <th>Criadas</th>
+                  <th>Conversão</th>
+                </tr>
+              </thead>
+              <tbody>
+                {d.linhas.map((l) => (
+                  <tr key={l.mes}>
+                    <td>
+                      {fmtMes(l.mes)}
+                      {l.mes === d.mesIncompleto && (
+                        <span style={{ color: "var(--amber)" }}> ·parcial</span>
+                      )}
+                    </td>
+                    <td>{fmtMoney(l.spend)}</td>
+                    <td>{fmtMoney(l.revenue)}</td>
+                    <td className={l.takeRate >= 0 ? "pos" : "neg"}>
+                      {fmtMoney(l.takeRate)}
+                    </td>
+                    <td>{fmtNum(l.transactions)}</td>
+                    <td>{fmtMoney(l.ticket)}</td>
+                    <td>{fmtMoney(l.cpa)}</td>
+                    <td>{fmtRoas(l.roas)}</td>
+                    <td>{l.created > 0 ? fmtNum(l.created) : "—"}</td>
+                    <td>{fmtPct(l.conversion)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -440,6 +558,11 @@ function BrandBlock({ brand, color }) {
   const takeRate = brand.revenue - brand.spend;
   const margin =
     brand.revenue > 0 ? ((takeRate / brand.revenue) * 100).toFixed(0) : null;
+  const ant = brand.anterior || null;
+  const d = (campo, melhorQuando) =>
+    ant ? (
+      <Delta atual={brand[campo]} anterior={ant[campo]} melhorQuando={melhorQuando} />
+    ) : null;
   return (
     <>
       <div className="section-title">
@@ -447,21 +570,31 @@ function BrandBlock({ brand, color }) {
         {brand.name}
       </div>
       <div className="cards">
-        <Card label="Gasto" value={fmtMoney(brand.spend)} />
-        <Card label="Receita paga" value={fmtMoney(brand.revenue)} />
+        <Card label="Gasto" value={fmtMoney(brand.spend)} delta={d("spend", null)} />
+        <Card
+          label="Receita paga"
+          value={fmtMoney(brand.revenue)}
+          delta={d("revenue", "maior")}
+        />
         <Card
           label="Take rate"
           value={fmtMoney(takeRate)}
           valueColor={takeRate >= 0 ? "var(--green)" : "var(--red)"}
           sub={margin != null ? `${margin}% da receita` : null}
+          delta={
+            ant ? (
+              <Delta atual={takeRate} anterior={ant.takeRate} melhorQuando="maior" />
+            ) : null
+          }
         />
         <Card
           label="Transações"
           value={fmtNum(brand.transactions)}
           sub={brand.ticket != null ? `Ticket ${fmtMoney(brand.ticket)}` : null}
+          delta={d("transactions", "maior")}
         />
-        <Card label="CPA" value={fmtMoney(brand.cpa)} />
-        <Card label="ROAS" value={fmtRoas(brand.roas)} />
+        <Card label="CPA" value={fmtMoney(brand.cpa)} delta={d("cpa", "menor")} />
+        <Card label="ROAS" value={fmtRoas(brand.roas)} delta={d("roas", "maior")} />
         <Card
           label="Conversão"
           value={fmtPct(brand.conversion)}
@@ -470,13 +603,14 @@ function BrandBlock({ brand, color }) {
               ? `${fmtNum(brand.convPaid)} pagas de ${fmtNum(brand.created)} criadas`
               : "sem dados de cobranças criadas"
           }
+          delta={d("conversion", "maior")}
         />
       </div>
     </>
   );
 }
 
-function Card({ label, value, sub, valueColor }) {
+function Card({ label, value, sub, valueColor, delta }) {
   return (
     <div className="card">
       <div className="label">{label}</div>
@@ -484,6 +618,7 @@ function Card({ label, value, sub, valueColor }) {
         {value}
       </div>
       {sub && <div className="sub">{sub}</div>}
+      {delta}
     </div>
   );
 }
