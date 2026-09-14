@@ -242,8 +242,9 @@ export default function Page() {
 }
 
 function TaxBlock({ brand }) {
-  const sobra = brand.net;
-  const margem = brand.revenue > 0 ? (sobra / brand.revenue) * 100 : null;
+  const lucro = brand.net;
+  const margem = brand.revenue > 0 ? (lucro / brand.revenue) * 100 : null;
+  const fixos = brand.custosFixos || [];
   return (
     <div className="cards" style={{ marginTop: 12 }}>
       <Card
@@ -252,17 +253,24 @@ function TaxBlock({ brand }) {
         valueColor="var(--red)"
         sub={
           brand.taxRate != null
-            ? `${fmtPct(brand.taxRate)} do faturado · ${(brand.regimes || []).join(" + ")}`
+            ? `${fmtPct(brand.taxRate)} do faturado · ${(brand.regimes || []).join(" + ")}` +
+              (brand.taxRateado ? " · rateado" : "")
             : null
         }
       />
       <Card
-        label="Sobra"
-        value={fmtMoney(sobra)}
-        valueColor={sobra >= 0 ? "var(--green)" : "var(--red)"}
+        label="Custos fixos"
+        value={fmtMoney(brand.fixedCost)}
+        valueColor="var(--red)"
+        sub={fixos.length ? fixos.map((c) => c.nome).join(" + ") : null}
+      />
+      <Card
+        label="Lucro líquido"
+        value={fmtMoney(lucro)}
+        valueColor={lucro >= 0 ? "var(--green)" : "var(--red)"}
         sub={
           margem != null
-            ? `${margem.toFixed(1).replace(".", ",")}% do faturado · receita − mídia − imposto`
+            ? `${margem.toFixed(1).replace(".", ",")}% · receita − mídia − imposto − fixos`
             : null
         }
       />
@@ -315,6 +323,8 @@ function MonthlySection() {
             <div style={{ marginTop: 4 }}>
               O mês corrente ({fmtMes(d.mesIncompleto)}) está <strong>incompleto</strong> —
               não leia como queda.
+              {d.custosFixos?.length > 0 &&
+                ` Custos fixos (${d.custosFixos.map((c) => c.nome).join(" + ")}) entram cheios no mês fechado e proporcionais no mês corrente.`}
               {d.semFunil && " O funil não respondeu; criadas e conversão ficam em —."}
             </div>
           </div>
@@ -333,7 +343,8 @@ function MonthlySection() {
                   <th>Criadas</th>
                   <th>Conversão</th>
                   <th>Imposto</th>
-                  <th>Sobra</th>
+                  <th>Fixos</th>
+                  <th>Lucro líq.</th>
                 </tr>
               </thead>
               <tbody>
@@ -365,6 +376,7 @@ function MonthlySection() {
                         </span>
                       )}
                     </td>
+                    <td className="neg">{fmtMoney(l.fixedCost)}</td>
                     <td className={l.net >= 0 ? "pos" : "neg"}>{fmtMoney(l.net)}</td>
                   </tr>
                 ))}
@@ -542,9 +554,6 @@ function Section({ brand, color, title }) {
   return (
     <>
       <BrandBlock brand={brand} color={color} />
-      {/* imposto só aparece no Total: a faixa do Simples e o adicional de IRPJ
-          são progressivos sobre o faturamento do CNPJ inteiro, então o rateio
-          por marca daria um número menor que o real */}
       {brand.tax != null && <TaxBlock brand={brand} />}
       <SourceBreakdown sources={brand.sources} total={brand.revenue} />
       <ChartCard series={brand.series} title={`${title} — dia a dia`} />
@@ -695,6 +704,7 @@ function DayTable({ series, title, comImposto }) {
   const tCreated = sum("created");
   const tConvPaid = sum("convPaid");
   const tTax = rows.reduce((a, r) => a + (r.tax || 0), 0);
+  const tFixo = rows.reduce((a, r) => a + (r.fixedCost || 0), 0);
 
   return (
     <div className="table-card">
@@ -716,7 +726,8 @@ function DayTable({ series, title, comImposto }) {
               <th>Criadas</th>
               <th>Conversão</th>
               {comImposto && <th>Imposto</th>}
-              {comImposto && <th>Sobra</th>}
+              {comImposto && <th>Fixos</th>}
+              {comImposto && <th>Lucro líq.</th>}
             </tr>
           </thead>
           <tbody>
@@ -737,6 +748,7 @@ function DayTable({ series, title, comImposto }) {
                 <td>{r.created > 0 ? fmtNum(r.created) : "—"}</td>
                 <td>{fmtPct(r.conversion)}</td>
                 {comImposto && <td className="neg">{fmtMoney(r.tax)}</td>}
+                {comImposto && <td className="neg">{fmtMoney(r.fixedCost)}</td>}
                 {comImposto && (
                   <td className={r.net >= 0 ? "pos" : "neg"}>{fmtMoney(r.net)}</td>
                 )}
@@ -758,9 +770,10 @@ function DayTable({ series, title, comImposto }) {
               <td>{tCreated > 0 ? fmtNum(tCreated) : "—"}</td>
               <td>{fmtPct(tCreated > 0 ? tConvPaid / tCreated : null)}</td>
               {comImposto && <td className="neg">{fmtMoney(tTax)}</td>}
+              {comImposto && <td className="neg">{fmtMoney(tFixo)}</td>}
               {comImposto && (
-                <td className={tRevenue - tSpend - tTax >= 0 ? "pos" : "neg"}>
-                  {fmtMoney(tRevenue - tSpend - tTax)}
+                <td className={tRevenue - tSpend - tTax - tFixo >= 0 ? "pos" : "neg"}>
+                  {fmtMoney(tRevenue - tSpend - tTax - tFixo)}
                 </td>
               )}
             </tr>
