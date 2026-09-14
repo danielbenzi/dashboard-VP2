@@ -145,6 +145,114 @@ const DB_IGNORED_STATUSES = (process.env.DB_IGNORED_STATUSES || "refunded,charge
 const DB_TZ_CONVERTE = (process.env.DB_TX_TZ || "utc").toLowerCase() !== "none";
 const repeatCache = new Map(); // lookback -> { at, payload }
 
+// ---------- Impostos ----------
+// Regime muda no meio da série: Simples Nacional até ago/26, Lucro Presumido
+// de set/26 em diante. O corte é por DATA, então a mesma tabela dia a dia
+// mistura os dois — cada dia usa o regime que valia nele.
+const IMPOSTO_ATIVO = (process.env.IMPOSTO_ATIVO || "1") !== "0";
+const IMPOSTO_CORTE_PRESUMIDO = process.env.IMPOSTO_CORTE_PRESUMIDO || "2026-09-01";
+
+// Lucro Presumido — serviços (presunção 32%), ISS-DF 2%
+const LP = {
+  pis: Number(process.env.LP_PIS) || 0.0065,
+  cofins: Number(process.env.LP_COFINS) || 0.03,
+  iss: Number(process.env.LP_ISS) || 0.02,
+  presuncao: Number(process.env.LP_PRESUNCAO) || 0.32,
+  irpj: Number(process.env.LP_IRPJ) || 0.15,
+  csll: Number(process.env.LP_CSLL) || 0.09,
+  adicional: Number(process.env.LP_ADICIONAL) || 0.1,
+  // O adicional de 10% incide sobre a base presumida que passa de R$ 20 mil
+  // POR MÊS do período de apuração (Lei 9.430/96, art. 4º). Trimestre cheio =
+  // 60 mil. Mas o trimestre em que a empresa ENTRA no Presumido tem menos
+  // meses: set/26 sozinho no Q3 dá limite de 20 mil, não 60 mil.
+  limiteMensal: Number(process.env.LP_LIMITE_ADICIONAL_MES) || 20000,
+};
+
+// Simples Nacional — Anexo V. Efetiva = (RBT12 × nominal − dedução) ÷ RBT12,
+// então ela sobe conforme o faturamento dos últimos 12 meses cresce.
+const SIMPLES_ANEXO_V = [
+  { ate: 180000, aliq: 0.155, ded: 0 },
+  { ate: 360000, aliq: 0.18, ded: 4500 },
+  { ate: 720000, aliq: 0.195, ded: 9900 },
+  { ate: 1800000, aliq: 0.205, ded: 17100 },
+  { ate: 3600000, aliq: 0.23, ded: 62100 },
+  { ate: Infinity, aliq: 0.305, ded: 540000 },
+];
+function efetivaSimples(rbt12) {
+  if (!(rbt12 > 0)) return SIMPLES_ANEXO_V[0].aliq;
+  const faixa = SIMPLES_ANEXO_V.find((f) => rbt12 <= f.ate);
+  return Math.max(0, (rbt12 * faixa.aliq - faixa.ded) / rbt12);
+}
+
+const trimestreDe = (data) =>
+  `${data.slice(0, 4)}-Q${Math.floor((Number(data.slice(5, 7)) - 1) / 3) + 1}`;
+
+// Limite do adicional no trimestre daquele dia: R$ 20 mil por mês do período,
+// contando só os meses já sob Lucro Presumido.
+function limiteAdicionalDoTrimestre(data) {
+  const ano = Number(data.slice(0, 4));
+  const mes = Number(data.slice(5, 7));
+  const primeiro = Math.floor((mes - 1) / 3) * 3 + 1;
+  const corteMes = `${IMPOSTO_CORTE_PRESUMIDO.slice(0, 7)}-01`;
+  let meses = 0;
+  for (let i = 0; i < 3; i++) {
+    const ym = `${ano}-${String(primeiro + i).padStart(2, "0")}-01`;
+    if (ym >= corteMes) meses++;
+  }
+  return LP.limiteMensal * Math.max(1, meses);
+}
+
+// Calcula o imposto de cada dia. `dias` precisa começar no PRIMEIRO DIA DO
+// TRIMESTRE (não na data que o dashboard mostra), senão o acumulado do
+// adicional começa zerado e o imposto sai menor do que é.
+function calculaImpostos(dias, rbt12PorMes) {
+  let acumBase = 0;
+  let trimestre = null;
+  let limite = 0;
+  return dias.map((d) => {
+    const tri = trimestreDe(d.date);
+    if (tri !== trimestre) {
+      trimestre = tri;
+      acumBase = 0;
+      limite = limiteAdicionalDoTrimestre(d.date);
+    }
+    if (d.date >= IMPOSTO_CORTE_PRESUMIDO) {
+      const base = d.revenue * LP.presuncao;
+      acumBase += base;
+      // só a parte da base DO DIA que passou dos 60 mil acumulados
+      const excedente = Math.max(0, Math.min(acumBase - limite, base));
+      const detalhe = {
+        pis: d.revenue * LP.pis,
+        cofins: d.revenue * LP.cofins,
+        iss: d.revenue * LP.iss,
+        irpj: base * LP.irpj,
+        adicionalIrpj: excedente * LP.adicional,
+        csll: base * LP.csll,
+      };
+      const imposto = Object.values(detalhe).reduce((a, b) => a + b, 0);
+      return {
+        date: d.date,
+        revenue: d.revenue,
+        regime: "Lucro Presumido",
+        imposto,
+        detalhe,
+        limiteAdicional: limite,
+        aliquotaEfetiva: d.revenue > 0 ? imposto / d.revenue : null,
+      };
+    }
+    const rbt12 = rbt12PorMes[d.date.slice(0, 7)] || 0;
+    const efetiva = efetivaSimples(rbt12);
+    return {
+      date: d.date,
+      revenue: d.revenue,
+      regime: "Simples Nacional (Anexo V)",
+      imposto: d.revenue * efetiva,
+      aliquotaEfetiva: efetiva,
+      rbt12,
+    };
+  });
+}
+
 // Cache em memória (por instância warm da função)
 const CACHE_TTL_MS = 2 * 60 * 1000;
 const memCache = new Map(); // key -> { at, payload }
@@ -1927,6 +2035,61 @@ async function debugFontes(from, to, nomes) {
   };
 }
 
+// Busca a receita necessária para o cálculo e devolve o imposto por dia.
+// Puxa MAIS do que a janela pedida de propósito: o adicional de IRPJ acumula
+// por trimestre e a alíquota do Simples depende dos 12 meses anteriores.
+async function fetchImpostos(from, to, nomes) {
+  // início do trimestre de `from`
+  const [y, m] = from.split("-").map(Number);
+  const inicioTrimestre = `${y}-${String(Math.floor((m - 1) / 3) * 3 + 1).padStart(2, "0")}-01`;
+  // 12 meses antes, para o RBT12 do Simples
+  const inicioRBT = new Date(Date.UTC(y, m - 1 - 12, 1)).toISOString().slice(0, 10);
+  const precisaRBT = from < IMPOSTO_CORTE_PRESUMIDO;
+  const inicio = precisaRBT && inicioRBT < inicioTrimestre ? inicioRBT : inicioTrimestre;
+
+  const bd = await fetchReceitaDoBanco(inicio, to, nomes, "dia");
+
+  // receita consolidada por dia (imposto é do CNPJ, não da marca)
+  const porDia = new Map();
+  for (const nome of nomes) {
+    for (const t of bd.porMarca[nome] || []) {
+      porDia.set(t.date, (porDia.get(t.date) || 0) + t.amount);
+    }
+  }
+
+  // RBT12: soma móvel dos 12 meses ANTERIORES ao mês de referência
+  const porMes = {};
+  for (const [dia, valor] of porDia) {
+    const mes = dia.slice(0, 7);
+    porMes[mes] = (porMes[mes] || 0) + valor;
+  }
+  const rbt12PorMes = {};
+  for (const mes of Object.keys(porMes)) {
+    const [my, mm] = mes.split("-").map(Number);
+    let soma = 0;
+    for (let i = 1; i <= 12; i++) {
+      const d = new Date(Date.UTC(my, mm - 1 - i, 1));
+      soma += porMes[d.toISOString().slice(0, 7)] || 0;
+    }
+    rbt12PorMes[mes] = soma;
+  }
+
+  const dias = [...porDia.entries()]
+    .map(([date, revenue]) => ({ date, revenue }))
+    .filter((d) => d.date >= inicioTrimestre)
+    .sort((a, b) => (a.date < b.date ? -1 : 1));
+
+  const calculado = calculaImpostos(dias, rbt12PorMes);
+  return {
+    porDia: Object.fromEntries(
+      calculado.filter((c) => inRange(c.date, from, to)).map((c) => [c.date, c])
+    ),
+    // o que veio antes de `from` só existe para o acumulado do trimestre
+    inicioTrimestre,
+    rbt12PorMes,
+  };
+}
+
 // GET /api/dashboard?mensal=1  (&meses=12)
 // Tabela mês a mês. Rota separada da principal: é outro recorte de tempo e o
 // frontend busca em paralelo, sem segurar a tela.
@@ -2000,6 +2163,22 @@ async function handleMensal(searchParams) {
       }
     }
 
+    // imposto do mês = soma do imposto diário (o adicional é trimestral, então
+    // não dá para aplicar uma alíquota fixa em cima do total do mês)
+    if (IMPOSTO_ATIVO) {
+      try {
+        const imp = await fetchImpostos(inicio, hoje, nomes);
+        for (const c of Object.values(imp.porDia)) {
+          const l = porMes.get(c.date.slice(0, 7));
+          if (!l) continue;
+          l.tax = (l.tax || 0) + c.imposto;
+          l.regime = c.regime;
+        }
+      } catch (e) {
+        /* sem imposto na tabela mensal; o resto continua */
+      }
+    }
+
     const linhas = [...porMes.values()]
       .sort((a, b) => (a.mes < b.mes ? 1 : -1))
       .map((l) => ({
@@ -2009,6 +2188,9 @@ async function handleMensal(searchParams) {
         cpa: l.transactions > 0 ? l.spend / l.transactions : null,
         roas: l.spend > 0 ? l.revenue / l.spend : null,
         conversion: l.created > 0 ? l.convPaid / l.created : null,
+        tax: l.tax ?? null,
+        taxRate: l.tax != null && l.revenue > 0 ? l.tax / l.revenue : null,
+        net: l.tax != null ? l.revenue - l.spend - l.tax : null,
       }));
 
     const payload = {
@@ -2401,6 +2583,35 @@ export async function GET(request) {
     series: Object.values(merged).sort((a, b) => (a.date < b.date ? -1 : 1)),
     sources: Object.values(mergedSources).sort((a, b) => b.revenue - a.revenue),
   };
+
+  // impostos: só no modo db (precisa varrer trimestre e 12 meses de histórico)
+  if (usandoBanco && IMPOSTO_ATIVO) {
+    try {
+      const imp = await fetchImpostos(from, to, [nameProcesso, namePlaca]);
+      const regimes = new Set();
+      let totalImposto = 0;
+      for (const p of total.series) {
+        const i = imp.porDia[p.date];
+        p.tax = i ? i.imposto : 0;
+        p.net = p.revenue - p.spend - p.tax;
+        if (i) regimes.add(i.regime);
+        totalImposto += p.tax;
+      }
+      total.tax = totalImposto;
+      total.net = total.revenue - total.spend - totalImposto;
+      total.taxRate = total.revenue > 0 ? totalImposto / total.revenue : null;
+      total.regimes = [...regimes];
+      total.taxDetail = imp.porDia;
+      notas.push(
+        `Imposto calculado sobre o faturamento CONSOLIDADO (as duas marcas), ` +
+          `porque tanto a faixa do Simples quanto o adicional de IRPJ são ` +
+          `progressivos — dividir por marca daria número menor que o real. ` +
+          `Sobra = receita − mídia − imposto; não inclui custo de dados nem fixo.`
+      );
+    } catch (e) {
+      warnings.push(`Impostos: ${e?.message || e} — cards de imposto ficam sem dados.`);
+    }
+  }
 
   // comparativo com o mesmo período do mês anterior
   let anterior = null;
