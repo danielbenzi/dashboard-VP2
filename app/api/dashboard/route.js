@@ -2113,6 +2113,174 @@ async function fetchImpostos(from, to, nomes) {
   };
 }
 
+// GET /api/dashboard?projecao=1
+// Projeção do fechamento do mês corrente. O imposto NÃO é extrapolado: ele é
+// recalculado sobre a receita projetada, porque o adicional de IRPJ é
+// progressivo no trimestre — multiplicar a média diária daria número errado.
+async function handleProjecao(searchParams) {
+  if (REVENUE_SOURCE !== "db") {
+    return NextResponse.json(
+      { erro: "a projeção precisa de REVENUE_SOURCE=db." },
+      { status: 400, headers: { "Cache-Control": "no-store" } }
+    );
+  }
+  const hoje = searchParams.get("hoje") || todayISO();
+  const mes = hoje.slice(0, 7);
+  const primeiro = `${mes}-01`;
+  const ultimoDia = diasNoMes(hoje);
+  const fim = `${mes}-${String(ultimoDia).padStart(2, "0")}`;
+  const diaHoje = Number(hoje.slice(8, 10));
+
+  const nomes = [
+    process.env.GADS_ACCOUNT_PROCESSO || "Verifica Processo",
+    process.env.GADS_ACCOUNT_PLACA || "Verifica Placa",
+  ];
+
+  try {
+    const budget = makeBudget(35000);
+    // trimestre inteiro: o acumulado do adicional precisa vir de antes do mês
+    const [y, m] = primeiro.split("-").map(Number);
+    const inicioTri = `${y}-${String(Math.floor((m - 1) / 3) * 3 + 1).padStart(2, "0")}-01`;
+
+    const [gads, bd] = await Promise.all([
+      fetchGoogleAds(primeiro, hoje, budget).catch(() => []),
+      fetchReceitaDoBanco(inicioTri, hoje, nomes, "dia"),
+    ]);
+
+    const receitaPorDia = new Map();
+    for (const nome of nomes) {
+      for (const t of bd.porMarca[nome] || []) {
+        receitaPorDia.set(t.date, (receitaPorDia.get(t.date) || 0) + t.amount);
+      }
+    }
+    const gastoPorDia = new Map();
+    for (const r of gads || []) {
+      const d = String(r.date).slice(0, 10);
+      gastoPorDia.set(d, (gastoPorDia.get(d) || 0) + num(r.spend));
+    }
+
+    const diaStr = (n) => `${mes}-${String(n).padStart(2, "0")}`;
+    // Dias COMPLETOS = 1 até ontem. Hoje fica de fora da média: um dia pela
+    // metade puxaria o ritmo para baixo e a projeção sairia pessimista.
+    const completos = [];
+    for (let d = 1; d < diaHoje; d++) {
+      completos.push({
+        date: diaStr(d),
+        revenue: receitaPorDia.get(diaStr(d)) || 0,
+        spend: gastoPorDia.get(diaStr(d)) || 0,
+      });
+    }
+    if (completos.length === 0) {
+      return NextResponse.json(
+        { erro: "ainda não há nenhum dia completo neste mês para projetar." },
+        { status: 400, headers: { "Cache-Control": "no-store" } }
+      );
+    }
+
+    // realizado inclui hoje (parcial)
+    let realRevenue = 0;
+    let realSpend = 0;
+    for (let d = 1; d <= diaHoje; d++) {
+      realRevenue += receitaPorDia.get(diaStr(d)) || 0;
+      realSpend += gastoPorDia.get(diaStr(d)) || 0;
+    }
+
+    // dias reais do trimestre ANTES do mês — alimentam o acumulado do adicional
+    const diasAnteriores = [...receitaPorDia.entries()]
+      .filter(([d]) => d < primeiro)
+      .map(([date, revenue]) => ({ date, revenue }))
+      .sort((a, b) => (a.date < b.date ? -1 : 1));
+
+    const media = (arr, campo) =>
+      arr.length ? arr.reduce((a, x) => a + x[campo], 0) / arr.length : 0;
+
+    const cenario = (nome, base) => {
+      const mRev = media(base, "revenue");
+      const mSpend = media(base, "spend");
+      const restantes = ultimoDia - diaHoje + 1; // hoje entra como dia projetado
+      const somaCompletos = (campo) => completos.reduce((a, x) => a + x[campo], 0);
+
+      const dias = [
+        ...diasAnteriores,
+        ...completos,
+        ...Array.from({ length: restantes }, (_, i) => ({
+          date: diaStr(diaHoje + i),
+          revenue: mRev,
+        })),
+      ];
+      const imposto = calculaImpostos(dias, {})
+        .filter((c) => c.date >= primeiro && c.date <= fim)
+        .reduce((a, c) => a + c.imposto, 0);
+
+      const revenue = somaCompletos("revenue") + mRev * restantes;
+      const spend = somaCompletos("spend") + mSpend * restantes;
+      const fixo = CUSTO_FIXO_MENSAL; // mês fechado paga o mensal cheio
+      return {
+        nome,
+        diasNaBase: base.length,
+        mediaDiaria: { revenue: mRev, spend: mSpend },
+        revenue,
+        spend,
+        takeRate: revenue - spend,
+        tax: imposto,
+        taxRate: revenue > 0 ? imposto / revenue : null,
+        fixedCost: fixo,
+        net: revenue - spend - imposto - fixo,
+        margem: revenue > 0 ? (revenue - spend - imposto - fixo) / revenue : null,
+        roas: spend > 0 ? revenue / spend : null,
+      };
+    };
+
+    // imposto do realizado, com o mesmo motor
+    const impostoReal = calculaImpostos(
+      [...diasAnteriores, ...completos, {
+        date: diaStr(diaHoje),
+        revenue: receitaPorDia.get(diaStr(diaHoje)) || 0,
+      }],
+      {}
+    )
+      .filter((c) => c.date >= primeiro && c.date <= hoje)
+      .reduce((a, c) => a + c.imposto, 0);
+    const fixoReal = CUSTO_FIXO_MENSAL * (diaHoje / ultimoDia);
+
+    return NextResponse.json(
+      {
+        mes,
+        hoje,
+        diasDoMes: ultimoDia,
+        diasDecorridos: diaHoje,
+        custosFixos: CUSTOS_FIXOS,
+        custoFixoMensal: CUSTO_FIXO_MENSAL,
+        realizado: {
+          nome: `realizado (1 a ${diaHoje})`,
+          revenue: realRevenue,
+          spend: realSpend,
+          takeRate: realRevenue - realSpend,
+          tax: impostoReal,
+          taxRate: realRevenue > 0 ? impostoReal / realRevenue : null,
+          fixedCost: fixoReal,
+          net: realRevenue - realSpend - impostoReal - fixoReal,
+          margem:
+            realRevenue > 0
+              ? (realRevenue - realSpend - impostoReal - fixoReal) / realRevenue
+              : null,
+          roas: realSpend > 0 ? realRevenue / realSpend : null,
+        },
+        cenarios: [
+          cenario("ritmo do mês", completos),
+          cenario("ritmo dos últimos 7 dias", completos.slice(-7)),
+        ],
+      },
+      { headers: { "Cache-Control": "no-store" } }
+    );
+  } catch (e) {
+    return NextResponse.json(
+      { erro: String(e?.message || e) },
+      { status: 500, headers: { "Cache-Control": "no-store" } }
+    );
+  }
+}
+
 // GET /api/dashboard?mensal=1  (&meses=12)
 // Tabela mês a mês. Rota separada da principal: é outro recorte de tempo e o
 // frontend busca em paralelo, sem segurar a tela.
@@ -2330,6 +2498,9 @@ export async function GET(request) {
 
   // /api/dashboard?mensal=1 — tabela mês a mês
   if (searchParams.get("mensal") === "1") return handleMensal(searchParams);
+
+  // /api/dashboard?projecao=1 — fechamento projetado do mês corrente
+  if (searchParams.get("projecao") === "1") return handleProjecao(searchParams);
 
   // /api/dashboard?debug=fontes — banco x API, para decidir a migração
   if (searchParams.get("debug") === "fontes") {
