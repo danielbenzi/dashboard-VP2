@@ -253,6 +253,26 @@ function calculaImpostos(dias, rbt12PorMes) {
   });
 }
 
+// ---------- Custos fixos mensais ----------
+// Fornecedores de dado que você paga todo mês independente de vender: entram
+// no lucro líquido, não no take rate. Formato: "Nome:valor,Nome:valor".
+const CUSTOS_FIXOS = (process.env.CUSTOS_FIXOS || "Judir:5000,Escavador:3000")
+  .split(",")
+  .map((item) => {
+    const [nome, valor] = item.split(":");
+    return { nome: (nome || "").trim(), valorMensal: Number(valor) || 0 };
+  })
+  .filter((c) => c.nome && c.valorMensal > 0);
+const CUSTO_FIXO_MENSAL = CUSTOS_FIXOS.reduce((a, c) => a + c.valorMensal, 0);
+
+const diasNoMes = (data) =>
+  new Date(Date.UTC(Number(data.slice(0, 4)), Number(data.slice(5, 7)), 0)).getUTCDate();
+
+// Rateio por dia: o mensal dividido pelos dias daquele mês. Assim uma janela
+// parcial (01 a 14/09) carrega só a fatia proporcional, sem nenhuma conta extra.
+const custoFixoDoDia = (data) =>
+  CUSTO_FIXO_MENSAL > 0 ? CUSTO_FIXO_MENSAL / diasNoMes(data) : 0;
+
 // Cache em memória (por instância warm da função)
 const CACHE_TTL_MS = 2 * 60 * 1000;
 const memCache = new Map(); // key -> { at, payload }
@@ -271,6 +291,9 @@ function firstOfMonthISO() {
   const [y, m] = todayISO().split("-");
   return `${y}-${m}-01`;
 }
+
+const fmtBRL = (v) =>
+  "R$ " + Number(v || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 function num(v) {
   const n = Number(v);
@@ -2190,7 +2213,22 @@ async function handleMensal(searchParams) {
         conversion: l.created > 0 ? l.convPaid / l.created : null,
         tax: l.tax ?? null,
         taxRate: l.tax != null && l.revenue > 0 ? l.tax / l.revenue : null,
-        net: l.tax != null ? l.revenue - l.spend - l.tax : null,
+        // mês fechado paga o mensal cheio; o mês corrente, a fatia até hoje
+        fixedCost:
+          CUSTO_FIXO_MENSAL *
+          (l.mes === hoje.slice(0, 7)
+            ? Number(hoje.slice(8, 10)) / diasNoMes(`${l.mes}-01`)
+            : 1),
+        net:
+          l.tax != null
+            ? l.revenue -
+              l.spend -
+              l.tax -
+              CUSTO_FIXO_MENSAL *
+                (l.mes === hoje.slice(0, 7)
+                  ? Number(hoje.slice(8, 10)) / diasNoMes(`${l.mes}-01`)
+                  : 1)
+            : null,
       }));
 
     const payload = {
@@ -2198,6 +2236,7 @@ async function handleMensal(searchParams) {
       ate: hoje,
       // o mês corrente está incompleto — dizer isso evita ler queda onde não há
       mesIncompleto: hoje.slice(0, 7),
+      custosFixos: CUSTOS_FIXOS,
       semFunil: !funil,
       linhas,
     };
@@ -2597,16 +2636,56 @@ export async function GET(request) {
         if (i) regimes.add(i.regime);
         totalImposto += p.tax;
       }
+      // custos fixos, rateados por dia
+      let totalFixo = 0;
+      for (const p of total.series) {
+        p.fixedCost = custoFixoDoDia(p.date);
+        p.net = p.revenue - p.spend - p.tax - p.fixedCost;
+        totalFixo += p.fixedCost;
+      }
+
       total.tax = totalImposto;
-      total.net = total.revenue - total.spend - totalImposto;
+      total.fixedCost = totalFixo;
+      total.net = total.revenue - total.spend - totalImposto - totalFixo;
       total.taxRate = total.revenue > 0 ? totalImposto / total.revenue : null;
       total.regimes = [...regimes];
-      total.taxDetail = imp.porDia;
+      total.custosFixos = CUSTOS_FIXOS;
+
+      // Rateio para as marcas, proporcional à receita DO DIA. O cálculo é
+      // consolidado porque a faixa do Simples e o adicional de IRPJ são
+      // progressivos sobre o CNPJ inteiro; só a divisão é proporcional.
+      const porDiaTotal = Object.fromEntries(total.series.map((p) => [p.date, p]));
+      for (const br of brands) {
+        let impostoMarca = 0;
+        let fixoMarca = 0;
+        for (const p of br.series) {
+          const t = porDiaTotal[p.date];
+          const fatia =
+            t && t.revenue > 0 ? p.revenue / t.revenue : 1 / brands.length;
+          p.tax = t ? t.tax * fatia : 0;
+          p.fixedCost = t ? t.fixedCost * fatia : 0;
+          p.net = p.revenue - p.spend - p.tax - p.fixedCost;
+          impostoMarca += p.tax;
+          fixoMarca += p.fixedCost;
+        }
+        br.tax = impostoMarca;
+        br.fixedCost = fixoMarca;
+        br.net = br.revenue - br.spend - impostoMarca - fixoMarca;
+        br.taxRate = br.revenue > 0 ? impostoMarca / br.revenue : null;
+        br.regimes = [...regimes];
+        br.taxRateado = true;
+        br.custosFixos = CUSTOS_FIXOS;
+      }
+
       notas.push(
-        `Imposto calculado sobre o faturamento CONSOLIDADO (as duas marcas), ` +
-          `porque tanto a faixa do Simples quanto o adicional de IRPJ são ` +
-          `progressivos — dividir por marca daria número menor que o real. ` +
-          `Sobra = receita − mídia − imposto; não inclui custo de dados nem fixo.`
+        `Imposto calculado sobre o faturamento CONSOLIDADO das duas marcas (a ` +
+          `faixa do Simples e o adicional de IRPJ são progressivos sobre o CNPJ ` +
+          `inteiro) e depois RATEADO por marca na proporção da receita do dia. ` +
+          `O total está certo; a divisão por marca é rateio, não apuração ` +
+          `separada.` +
+          (CUSTO_FIXO_MENSAL > 0
+            ? ` Custos fixos: ${CUSTOS_FIXOS.map((c) => `${c.nome} ${fmtBRL(c.valorMensal)}`).join(" + ")} = ${fmtBRL(CUSTO_FIXO_MENSAL)}/mês, divididos pelos dias do mês.`
+            : "")
       );
     } catch (e) {
       warnings.push(`Impostos: ${e?.message || e} — cards de imposto ficam sem dados.`);
