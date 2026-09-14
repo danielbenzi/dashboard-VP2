@@ -233,6 +233,7 @@ export default function Page() {
             color="var(--placa)"
             title={data.brands[1].name}
           />
+          <ProjecaoSection />
           <MonthlySection />
           <RepeatSection />
         </>
@@ -275,6 +276,134 @@ function TaxBlock({ brand }) {
         }
       />
     </div>
+  );
+}
+
+// Fechamento projetado do mês corrente (?projecao=1).
+// Colunas = cenários, linhas = métricas: com 3 colunas isso lê melhor do que a
+// tabela normal, porque o que interessa é comparar o mesmo número entre elas.
+function ProjecaoSection() {
+  const [d, setD] = useState(null);
+  const [err, setErr] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let vivo = true;
+    fetch("/api/dashboard?projecao=1", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((j) => {
+        if (!vivo) return;
+        if (j.erro) setErr(j.erro);
+        else setD(j);
+      })
+      .catch((e) => vivo && setErr(e.message))
+      .finally(() => vivo && setLoading(false));
+    return () => {
+      vivo = false;
+    };
+  }, []);
+
+  const colunas = d ? [d.realizado, ...d.cenarios] : [];
+  const linhas = [
+    { rot: "Investimento", get: (c) => fmtMoney(c.spend), cls: () => "neg" },
+    { rot: "Receita", get: (c) => fmtMoney(c.revenue) },
+    {
+      rot: "Take rate",
+      get: (c) => fmtMoney(c.takeRate),
+      cls: (c) => (c.takeRate >= 0 ? "pos" : "neg"),
+    },
+    {
+      rot: "Imposto",
+      get: (c) => fmtMoney(c.tax),
+      sub: (c) => (c.taxRate != null ? fmtPct(c.taxRate) : null),
+      cls: () => "neg",
+    },
+    { rot: "Custos fixos", get: (c) => fmtMoney(c.fixedCost), cls: () => "neg" },
+    {
+      rot: "Lucro líquido",
+      get: (c) => fmtMoney(c.net),
+      sub: (c) => (c.margem != null ? fmtPct(c.margem) + " de margem" : null),
+      cls: (c) => (c.net >= 0 ? "pos" : "neg"),
+      forte: true,
+    },
+    { rot: "ROAS", get: (c) => fmtRoas(c.roas) },
+  ];
+
+  return (
+    <>
+      <div className="section-title">
+        <span className="dot" style={{ background: "var(--amber)" }} />
+        Projeção do mês
+      </div>
+
+      {loading && <div className="table-card loading">Carregando…</div>}
+      {err && <div className="banner">Projeção indisponível: {err}</div>}
+
+      {d && (
+        <div className="table-card">
+          <div className="legend" style={{ display: "block", lineHeight: 1.5 }}>
+            <strong style={{ color: "var(--text)" }}>
+              Como o mês fecha se o ritmo continuar
+            </strong>
+            <div style={{ marginTop: 4 }}>
+              {d.diasDecorridos} de {d.diasDoMes} dias corridos. A média diária usa
+              só os dias <strong>fechados</strong> (1 a {d.diasDecorridos - 1}) —
+              hoje está pela metade e puxaria o ritmo para baixo.
+              {" "}O imposto da projeção é <strong>recalculado</strong> sobre a receita
+              projetada, não multiplicado: o adicional de IRPJ só incide acima de{" "}
+              R$ 20 mil de lucro presumido por mês do trimestre, então a alíquota
+              efetiva sobe conforme o mês cresce.
+              {d.custosFixos?.length > 0 &&
+                ` Nos cenários, ${d.custosFixos.map((c) => c.nome).join(" + ")} entram cheios (${fmtMoney(d.custoFixoMensal)}); no realizado, só a parte proporcional aos dias já corridos.`}
+            </div>
+          </div>
+          <div className="table-scroll">
+            <table className="day-table">
+              <thead>
+                <tr>
+                  <th />
+                  {colunas.map((c) => (
+                    <th key={c.nome} style={{ textAlign: "right" }}>
+                      {c.nome}
+                      {c.diasNaBase != null && (
+                        <div style={{ color: "var(--muted)", fontWeight: 400 }}>
+                          base: {c.diasNaBase} dia{c.diasNaBase === 1 ? "" : "s"} ·{" "}
+                          {fmtMoney(c.mediaDiaria.revenue)}/dia
+                        </div>
+                      )}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {linhas.map((l) => (
+                  <tr key={l.rot}>
+                    <td style={{ color: "var(--muted)", whiteSpace: "nowrap" }}>
+                      {l.rot}
+                    </td>
+                    {colunas.map((c) => (
+                      <td
+                        key={c.nome}
+                        className={l.cls ? l.cls(c) : undefined}
+                        style={l.forte ? { fontWeight: 600 } : undefined}
+                      >
+                        {l.get(c)}
+                        {l.sub?.(c) && (
+                          <span style={{ color: "var(--muted)", fontWeight: 400 }}>
+                            {" "}
+                            {l.sub(c)}
+                          </span>
+                        )}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 
