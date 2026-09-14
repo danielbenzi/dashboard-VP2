@@ -241,6 +241,35 @@ export default function Page() {
   );
 }
 
+function TaxBlock({ brand }) {
+  const sobra = brand.net;
+  const margem = brand.revenue > 0 ? (sobra / brand.revenue) * 100 : null;
+  return (
+    <div className="cards" style={{ marginTop: 12 }}>
+      <Card
+        label="Imposto"
+        value={fmtMoney(brand.tax)}
+        valueColor="var(--red)"
+        sub={
+          brand.taxRate != null
+            ? `${fmtPct(brand.taxRate)} do faturado · ${(brand.regimes || []).join(" + ")}`
+            : null
+        }
+      />
+      <Card
+        label="Sobra"
+        value={fmtMoney(sobra)}
+        valueColor={sobra >= 0 ? "var(--green)" : "var(--red)"}
+        sub={
+          margem != null
+            ? `${margem.toFixed(1).replace(".", ",")}% do faturado · receita − mídia − imposto`
+            : null
+        }
+      />
+    </div>
+  );
+}
+
 // Tabela mês a mês. Rota separada (?mensal=1), buscada em paralelo.
 function MonthlySection() {
   const [d, setD] = useState(null);
@@ -303,6 +332,8 @@ function MonthlySection() {
                   <th>ROAS</th>
                   <th>Criadas</th>
                   <th>Conversão</th>
+                  <th>Imposto</th>
+                  <th>Sobra</th>
                 </tr>
               </thead>
               <tbody>
@@ -325,6 +356,16 @@ function MonthlySection() {
                     <td>{fmtRoas(l.roas)}</td>
                     <td>{l.created > 0 ? fmtNum(l.created) : "—"}</td>
                     <td>{fmtPct(l.conversion)}</td>
+                    <td className="neg">
+                      {fmtMoney(l.tax)}
+                      {l.taxRate != null && (
+                        <span style={{ color: "var(--muted)" }}>
+                          {" "}
+                          {fmtPct(l.taxRate)}
+                        </span>
+                      )}
+                    </td>
+                    <td className={l.net >= 0 ? "pos" : "neg"}>{fmtMoney(l.net)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -501,9 +542,17 @@ function Section({ brand, color, title }) {
   return (
     <>
       <BrandBlock brand={brand} color={color} />
+      {/* imposto só aparece no Total: a faixa do Simples e o adicional de IRPJ
+          são progressivos sobre o faturamento do CNPJ inteiro, então o rateio
+          por marca daria um número menor que o real */}
+      {brand.tax != null && <TaxBlock brand={brand} />}
       <SourceBreakdown sources={brand.sources} total={brand.revenue} />
       <ChartCard series={brand.series} title={`${title} — dia a dia`} />
-      <DayTable series={brand.series} title={`${title} — tabela dia a dia`} />
+      <DayTable
+        series={brand.series}
+        title={`${title} — tabela dia a dia`}
+        comImposto={brand.tax != null}
+      />
     </>
   );
 }
@@ -634,7 +683,7 @@ function enrich(series) {
   }));
 }
 
-function DayTable({ series, title }) {
+function DayTable({ series, title, comImposto }) {
   const rows = useMemo(() => enrich(series).slice().reverse(), [series]);
 
   if (rows.length === 0) return null;
@@ -645,6 +694,7 @@ function DayTable({ series, title }) {
   const tTx = sum("transactions");
   const tCreated = sum("created");
   const tConvPaid = sum("convPaid");
+  const tTax = rows.reduce((a, r) => a + (r.tax || 0), 0);
 
   return (
     <div className="table-card">
@@ -665,6 +715,8 @@ function DayTable({ series, title }) {
               <th>ROAS</th>
               <th>Criadas</th>
               <th>Conversão</th>
+              {comImposto && <th>Imposto</th>}
+              {comImposto && <th>Sobra</th>}
             </tr>
           </thead>
           <tbody>
@@ -684,6 +736,10 @@ function DayTable({ series, title }) {
                 <td>{fmtRoas(r.roas)}</td>
                 <td>{r.created > 0 ? fmtNum(r.created) : "—"}</td>
                 <td>{fmtPct(r.conversion)}</td>
+                {comImposto && <td className="neg">{fmtMoney(r.tax)}</td>}
+                {comImposto && (
+                  <td className={r.net >= 0 ? "pos" : "neg"}>{fmtMoney(r.net)}</td>
+                )}
               </tr>
             ))}
           </tbody>
@@ -701,6 +757,12 @@ function DayTable({ series, title }) {
               <td>{fmtRoas(tSpend > 0 ? tRevenue / tSpend : null)}</td>
               <td>{tCreated > 0 ? fmtNum(tCreated) : "—"}</td>
               <td>{fmtPct(tCreated > 0 ? tConvPaid / tCreated : null)}</td>
+              {comImposto && <td className="neg">{fmtMoney(tTax)}</td>}
+              {comImposto && (
+                <td className={tRevenue - tSpend - tTax >= 0 ? "pos" : "neg"}>
+                  {fmtMoney(tRevenue - tSpend - tTax)}
+                </td>
+              )}
             </tr>
           </tfoot>
         </table>
