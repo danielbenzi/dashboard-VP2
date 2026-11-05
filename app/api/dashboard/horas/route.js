@@ -1,568 +1,250 @@
-"use client";
-
-// app/components/ConversaoHoras.js
+// app/api/dashboard/horas/route.js
 //
-// Arquivo NOVO. Não encosta no page.js que já existe — ele só importa daqui.
+// Rota NOVA e independente: /api/dashboard/horas
+// Não encosta no route.js que já existe. Arquivo próprio, pasta própria.
 //
-//   <ConversaoHojeSection />      -> hoje, hora a hora (sempre hoje)
-//   <ConversaoHistoricoSection /> -> dia da semana × hora, por dia da semana,
-//                                    por hora e dia a dia
+// Duas respostas numa query só:
+//   1) HOJE, hora a hora (sempre o dia de hoje em Brasília)
+//   2) HISTÓRICO: dia da semana × hora, por dia da semana, por hora, dia a dia
 //
-// As duas compartilham o mesmo fetch, então /api/dashboard/horas é chamada
-// UMA vez, não duas.
+// SEMÂNTICA — a decisão que define o número:
+//   A conversão é contada pela hora de CRIAÇÃO da cobrança, não a de pagamento.
+//   Uma cobrança criada 14h50 e paga 15h10 conta inteira nas 14h. É o que
+//   responde "qual hora converte melhor" — pela data de pagamento, a hora que
+//   recebeu o PIX roubaria o crédito da hora que gerou a intenção.
+//
+// Variáveis de ambiente (todas opcionais menos DATABASE_URL, que você já tem):
+//   DB_TX_TABLE       = public.transactions
+//   DB_PAID_STATUSES    = paid,approved      (mesmas envs do route.js principal)
+//   DB_IGNORED_STATUSES = refunded,chargeback
+//   HORAS_DIAS_PADRAO = 28
 
-import { useEffect, useMemo, useState } from "react";
+import { NextResponse } from "next/server";
 
-const BRL = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
-const NUM = new Intl.NumberFormat("pt-BR");
-const fmtMoney = (v) => (v == null || !Number.isFinite(v) ? "—" : BRL.format(v));
-const fmtNum = (v) => (v == null || !Number.isFinite(v) ? "—" : NUM.format(Math.round(v)));
-const fmtPct = (v) =>
-  v == null || !Number.isFinite(v) ? "—" : (v * 100).toFixed(1).replace(".", ",") + "%";
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
-// Rampa sequencial de UM tom (azul), clara = converte mais. Validada contra o
-// fundo escuro do dashboard: passa monotonia de luminosidade, gap entre
-// degraus e contraste do degrau mais escuro contra a superfície.
-const RAMPA = ["#184f95", "#256abf", "#3987e5", "#6da7ec", "#9ec5f4"];
-// Abaixo desse volume de cobranças criadas a célula não ganha cor: 2 de 2 pagas
-// é 100% e não quer dizer nada. Fica com hachura e sai do cálculo das faixas.
-const VOLUME_MINIMO = 5;
+const TZ = "America/Sao_Paulo";
+const DOW_NOMES = ["Domingo", "Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado"];
+const DOW_CURTO = ["dom", "seg", "ter", "qua", "qui", "sex", "sáb"];
 
-// Store compartilhado entre as duas seções: UMA chamada por ciclo, não duas.
-// Recarrega sozinho a cada 5 min e quando a aba volta ao foco — a página
-// principal só atualiza no botão, mas aqui o número muda a cada hora.
-const INTERVALO_MS = 5 * 60 * 1000;
-const store = { d: null, err: null, loading: false, at: null, subs: new Set(), timer: null };
-const notifica = () => store.subs.forEach((fn) => fn());
+const listaEnv = (nome, padrao) =>
+  (process.env[nome] || padrao)
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
 
-async function carregaHoras() {
-  if (store.loading) return;
-  store.loading = true;
-  notifica();
-  try {
-    const r = await fetch("/api/dashboard/horas", { cache: "no-store" });
-    const j = await r.json();
-    if (j.erro) store.err = j.erro;
-    else {
-      store.d = j;
-      store.err = null;
-      store.at = new Date();
-    }
-  } catch (e) {
-    store.err = e.message;
-  } finally {
-    store.loading = false;
-    notifica();
-  }
+const STATUS_PAGOS = listaEnv("DB_PAID_STATUSES", "paid,approved");
+const STATUS_IGNORA = listaEnv("DB_IGNORED_STATUSES", "refunded,chargeback");
+
+// Descobre as colunas em tempo de execução. O schema não está versionado aqui,
+// então chutar nome de coluna é como a gente já se queimou antes.
+async function detectaColunas(client, tabela) {
+  const [schema, nome] = tabela.includes(".") ? tabela.split(".") : ["public", tabela];
+  const { rows } = await client.query(
+    `SELECT column_name, data_type
+       FROM information_schema.columns
+      WHERE table_schema = $1 AND table_name = $2`,
+    [schema.replace(/"/g, ""), nome.replace(/"/g, "")]
+  );
+  if (!rows.length) throw new Error(`tabela ${tabela} não encontrada`);
+
+  const acha = (cands) =>
+    cands
+      .map((c) => rows.find((r) => r.column_name.toLowerCase() === c.toLowerCase()))
+      .find(Boolean);
+
+  const data = acha(["createdAtBr", "createdAt", "created_at", "criadoEm"]);
+  const status = acha(["status", "paymentStatus", "situacao"]);
+  const valor = acha(["amount", "value", "valor", "total"]);
+  if (!data) throw new Error(`nenhuma coluna de criação encontrada em ${tabela}`);
+  if (!status) throw new Error(`nenhuma coluna de status encontrada em ${tabela}`);
+
+  return {
+    data: data.column_name,
+    dataTipo: data.data_type,
+    status: status.column_name,
+    valor: valor ? valor.column_name : null,
+  };
 }
 
-function useHoras() {
-  const [, force] = useState(0);
-  useEffect(() => {
-    const fn = () => force((n) => n + 1);
-    store.subs.add(fn);
-    if (!store.d && !store.loading) carregaHoras();
-    if (!store.timer) {
-      store.timer = setInterval(carregaHoras, INTERVALO_MS);
-      document.addEventListener("visibilitychange", onVisivel);
-    }
-    return () => {
-      store.subs.delete(fn);
-      if (store.subs.size === 0 && store.timer) {
-        clearInterval(store.timer);
-        store.timer = null;
-        document.removeEventListener("visibilitychange", onVisivel);
-      }
-    };
-  }, []);
-  return { d: store.d, err: store.err, loading: store.loading && !store.d, at: store.at, recarrega: carregaHoras };
-}
-function onVisivel() {
-  if (document.visibilityState !== "visible" || !store.at) return;
-  if (Date.now() - store.at.getTime() > 60 * 1000) carregaHoras();
+// Converte a coluna para a hora LOCAL de Brasília respeitando o TIPO:
+//  - nome terminando em "Br": já está em BRT, não mexe
+//  - timestamptz: converte direto
+//  - timestamp cru (padrão do Prisma, guarda UTC): marca como UTC e converte
+export function exprHoraLocal(col, tipo) {
+  const q = `"${col}"`;
+  if (/Br$/.test(col)) return q;
+  if (/with time zone/i.test(tipo)) return `(${q} AT TIME ZONE '${TZ}')`;
+  return `((${q} AT TIME ZONE 'UTC') AT TIME ZONE '${TZ}')`;
 }
 
-const fmtHoraAt = (dt) =>
-  dt ? dt.toLocaleTimeString("pt-BR", { timeZone: "America/Sao_Paulo", hour: "2-digit", minute: "2-digit" }) : "";
-
-const hhmm = (h) => String(h).padStart(2, "0") + "h";
-
-// Faixas por QUANTIL das células com volume suficiente. Faixa fixa não serve:
-// se a conversão vive entre 52% e 58%, uma escala de 0 a 100% pinta tudo igual
-// e o heatmap não mostra nada.
-function fazFaixas(valores) {
-  const v = valores.filter((x) => x != null).sort((a, b) => a - b);
-  if (v.length < RAMPA.length) return null;
-  const corte = [];
-  for (let i = 1; i < RAMPA.length; i++) {
-    corte.push(v[Math.floor((v.length * i) / RAMPA.length)]);
-  }
-  return corte;
+export function buildHorasSql(tabela, cols) {
+  const ts = exprHoraLocal(cols.data, cols.dataTipo);
+  const valor = cols.valor ? `COALESCE("${cols.valor}", 0)::numeric` : `0::numeric`;
+  // status normalizado: o banco guarda "PAID", a env diz "paid"
+  const st = `lower(COALESCE("${cols.status}"::text, ''))`;
+  return `
+    WITH base AS (
+      SELECT ${ts} AS ts, ${st} AS status, ${valor} AS valor
+        FROM ${tabela}
+       WHERE ${ts} >= $1::timestamp
+         AND ${ts} <  ($2::timestamp + interval '1 day')
+    )
+    SELECT
+      to_char(ts, 'YYYY-MM-DD')                                   AS dia,
+      EXTRACT(dow  FROM ts)::int                                  AS dow,
+      EXTRACT(hour FROM ts)::int                                  AS hora,
+      count(*) FILTER (WHERE NOT (status = ANY($3::text[])))      AS criadas,
+      count(*) FILTER (WHERE status = ANY($4::text[]))            AS pagas,
+      COALESCE(sum(valor) FILTER (WHERE status = ANY($4::text[])), 0) AS receita
+    FROM base
+    GROUP BY 1, 2, 3
+    ORDER BY 1, 3`;
 }
-const corDaFaixa = (valor, cortes) => {
-  if (valor == null || !cortes) return null;
-  let i = 0;
-  while (i < cortes.length && valor >= cortes[i]) i++;
-  return RAMPA[i];
+
+const zero = () => ({ criadas: 0, pagas: 0, receita: 0 });
+const soma = (a, b) => {
+  a.criadas += b.criadas;
+  a.pagas += b.pagas;
+  a.receita += b.receita;
+  return a;
 };
+// Conversão só existe se houve cobrança criada. Sem isso, 0/0 viraria 0% e uma
+// hora morta da madrugada apareceria como "péssima conversão" em vez de vazia.
+const comTaxa = (o) => ({
+  ...o,
+  receita: Number(o.receita.toFixed(2)),
+  conversao: o.criadas > 0 ? o.pagas / o.criadas : null,
+  ticket: o.pagas > 0 ? Number((o.receita / o.pagas).toFixed(2)) : null,
+});
 
-export function ConversaoHojeSection() {
-  const { d, err, loading, at, recarrega } = useHoras();
-  const horas = d?.hoje?.horas || [];
-  // O máximo da barra ignora as horas de amostra baixa: uma hora com 1 de 1
-  // paga marcaria 100% e esmagaria todas as barras reais contra o zero.
-  const maxConv = Math.max(
-    ...horas
-      .filter((h) => h.criadas >= VOLUME_MINIMO)
-      .map((h) => h.conversao ?? 0),
-    0.0001
-  );
-  const agora = new Date().toLocaleString("en-CA", {
-    timeZone: "America/Sao_Paulo",
-    hour: "2-digit",
-    hour12: false,
-  });
-  const horaAtual = Number(String(agora).slice(-2));
+export function montaHorasPayload(linhas, hojeISO, dias) {
+  const hojeHoras = Array.from({ length: 24 }, () => zero());
+  const matriz = new Map();
+  const porDow = new Map();
+  const porHora = Array.from({ length: 24 }, () => zero());
+  const porDia = new Map();
+  const diasPorDow = new Map();
 
-  return (
-    <>
-      <div className="section-title">
-        <span className="dot" style={{ background: RAMPA[3] }} />
-        Conversão de hoje, hora a hora
-      </div>
+  for (const r of linhas) {
+    const v = {
+      criadas: Number(r.criadas),
+      pagas: Number(r.pagas),
+      receita: Number(r.receita),
+    };
+    const dow = Number(r.dow);
+    const hora = Number(r.hora);
 
-      {loading && <div className="table-card loading">Carregando…</div>}
-      {err && <div className="banner">Conversão por hora indisponível: {err}</div>}
+    if (r.dia === hojeISO) {
+      soma(hojeHoras[hora], v);
+      continue; // hoje está incompleto: não entra na média histórica
+    }
 
-      {d && (
-        <div className="table-card">
-          <div className="legend" style={{ display: "block", lineHeight: 1.5 }}>
-            <strong style={{ color: "var(--text)" }}>
-              {d.hoje.date.slice(8, 10)}/{d.hoje.date.slice(5, 7)} ·{" "}
-              {fmtPct(d.hoje.total.conversao)} no dia ({fmtNum(d.hoje.total.pagas)} de{" "}
-              {fmtNum(d.hoje.total.criadas)})
-            </strong>
-            <span style={{ marginLeft: 10, color: "var(--muted)", fontSize: 12 }}>
-              atualizado às {fmtHoraAt(at)} ·{" "}
-              <a
-                href="#"
-                onClick={(e) => {
-                  e.preventDefault();
-                  recarrega();
-                }}
-                style={{ color: "inherit" }}
-              >
-                atualizar
-              </a>
-            </span>
-            <div style={{ marginTop: 4 }}>
-              A hora é a da <strong>criação</strong> da cobrança, não a do pagamento:
-              uma cobrança criada 14h50 e paga 15h10 conta inteira nas 14h — é o que
-              responde qual horário converte. Hora sem cobrança criada aparece como
-              — , não como 0%.
-            </div>
-          </div>
-          <div className="table-scroll">
-            <table className="day-table">
-              <thead>
-                <tr>
-                  <th>Hora</th>
-                  <th>Criadas</th>
-                  <th>Pagas</th>
-                  <th>Conversão</th>
-                  <th>Receita</th>
-                  <th>Ticket</th>
-                </tr>
-              </thead>
-              <tbody>
-                {horas.map((h) => {
-                  const passou = h.hora <= horaAtual;
-                  // Mesma regra do heatmap: 1 de 2 pagas é 50% e não quer dizer
-                  // nada. A barra some para não dar peso visual de hora boa; o
-                  // número fica, porque numa tabela ele é honesto.
-                  const pouco = h.criadas > 0 && h.criadas < VOLUME_MINIMO;
-                  return (
-                    <tr
-                      key={h.hora}
-                      style={{ opacity: passou ? 1 : 0.35 }}
-                      title={
-                        !passou
-                          ? "ainda não aconteceu hoje"
-                          : pouco
-                          ? `só ${h.criadas} cobrança(s) criada(s) — amostra pequena demais para ler como taxa`
-                          : undefined
-                      }
-                    >
-                      <td style={{ whiteSpace: "nowrap" }}>
-                        {hhmm(h.hora)}
-                        {h.hora === horaAtual && (
-                          <span style={{ color: "var(--amber)" }}> ·agora</span>
-                        )}
-                      </td>
-                      <td>{h.criadas > 0 ? fmtNum(h.criadas) : "—"}</td>
-                      <td>{h.criadas > 0 ? fmtNum(h.pagas) : "—"}</td>
-                      <td>
-                        {h.conversao == null ? (
-                          "—"
-                        ) : (
-                          <span
-                            style={{
-                              display: "inline-flex",
-                              alignItems: "center",
-                              gap: 8,
-                              width: "100%",
-                            }}
-                          >
-                            <span
-                              aria-hidden="true"
-                              style={{
-                                flex: "0 0 auto",
-                                width: pouco
-                                  ? "64px"
-                                  : `${Math.max(2, (h.conversao / maxConv) * 64)}px`,
-                                height: 8,
-                                borderRadius: 4,
-                                background: pouco ? "transparent" : RAMPA[3],
-                                border: pouco
-                                  ? "1px dashed var(--muted)"
-                                  : "none",
-                              }}
-                            />
-                            <span
-                              style={{
-                                fontVariantNumeric: "tabular-nums",
-                                color: pouco ? "var(--muted)" : undefined,
-                              }}
-                            >
-                              {fmtPct(h.conversao)}
-                              {pouco && (
-                                <span style={{ fontSize: 11 }}> ·amostra baixa</span>
-                              )}
-                            </span>
-                          </span>
-                        )}
-                      </td>
-                      <td>{h.receita > 0 ? fmtMoney(h.receita) : "—"}</td>
-                      <td>{h.ticket == null ? "—" : fmtMoney(h.ticket)}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-    </>
-  );
+    const k = `${dow}|${hora}`;
+    soma(matriz.get(k) || matriz.set(k, zero()).get(k), v);
+    soma(porDow.get(dow) || porDow.set(dow, zero()).get(dow), v);
+    soma(porHora[hora], v);
+    soma(porDia.get(r.dia) || porDia.set(r.dia, zero()).get(r.dia), v);
+    if (!diasPorDow.has(dow)) diasPorDow.set(dow, new Set());
+    diasPorDow.get(dow).add(r.dia);
+  }
+
+  const hoje = {
+    date: hojeISO,
+    horas: hojeHoras.map((h, i) => ({ hora: i, ...comTaxa(h) })),
+    total: comTaxa(hojeHoras.reduce((a, h) => soma(a, h), zero())),
+  };
+
+  const totalHist = [...porDow.values()].reduce((a, v) => soma(a, { ...v }), zero());
+  const historico = {
+    dias,
+    matriz: Array.from({ length: 7 }, (_, dow) =>
+      Array.from({ length: 24 }, (_, hora) => ({
+        dow,
+        hora,
+        ...comTaxa(matriz.get(`${dow}|${hora}`) || zero()),
+      }))
+    ),
+    porDiaSemana: Array.from({ length: 7 }, (_, dow) => ({
+      dow,
+      nome: DOW_NOMES[dow],
+      curto: DOW_CURTO[dow],
+      diasNaBase: diasPorDow.get(dow)?.size || 0,
+      ...comTaxa(porDow.get(dow) || zero()),
+    })),
+    porHora: porHora.map((h, i) => ({ hora: i, ...comTaxa(h) })),
+    porDia: [...porDia.entries()]
+      .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+      .map(([dia, v]) => ({
+        dia,
+        dow: new Date(`${dia}T12:00:00Z`).getUTCDay(),
+        ...comTaxa(v),
+      })),
+    total: comTaxa(totalHist),
+  };
+
+  return { tz: TZ, hoje, historico };
 }
 
-export function ConversaoHistoricoSection() {
-  const { d, err, loading } = useHoras();
-  const [aba, setAba] = useState("matriz");
+export async function GET(request) {
+  const { searchParams } = new URL(request.url);
 
-  const hist = d?.historico;
-  const cortes = useMemo(() => {
-    if (!hist) return null;
-    return fazFaixas(
-      hist.matriz
-        .flat()
-        .filter((c) => c.criadas >= VOLUME_MINIMO)
-        .map((c) => c.conversao)
+  if (!process.env.DATABASE_URL) {
+    return NextResponse.json(
+      { erro: "DATABASE_URL não configurada." },
+      { status: 400, headers: { "Cache-Control": "no-store" } }
     );
-  }, [hist]);
+  }
 
-  if (loading) return <div className="table-card loading">Carregando…</div>;
-  if (err) return null; // o erro já apareceu na seção de hoje
-  if (!hist) return null;
-
-  const curto = ["dom", "seg", "ter", "qua", "qui", "sex", "sáb"];
-
-  return (
-    <>
-      <div className="section-title">
-        <span className="dot" style={{ background: RAMPA[1] }} />
-        Conversão por dia da semana e hora
-      </div>
-
-      <div className="table-card">
-        <div className="legend" style={{ display: "block", lineHeight: 1.5 }}>
-          <strong style={{ color: "var(--text)" }}>
-            Últimos {hist.dias} dias ({d.de.slice(8, 10)}/{d.de.slice(5, 7)} a{" "}
-            {d.ate.slice(8, 10)}/{d.ate.slice(5, 7)}) · {fmtPct(hist.total.conversao)}{" "}
-            no período
-          </strong>
-          <div style={{ marginTop: 4 }}>
-            Hoje fica de fora: o dia está pela metade e puxaria a média da hora para
-            baixo. Célula com menos de {VOLUME_MINIMO} cobranças criadas fica
-            hachurada e <strong>sem cor</strong> — 2 de 2 pagas é 100% e não quer
-            dizer nada. As faixas de cor são quantis das células com volume, não uma
-            escala de 0 a 100%: se a conversão vive entre 52% e 58%, uma escala fixa
-            pintaria tudo igual.
-          </div>
-        </div>
-
-        <div className="bar" style={{ display: "flex", gap: 8, flexWrap: "wrap", margin: "0 0 12px" }}>
-          {[
-            ["matriz", "Dia × hora"],
-            ["dow", "Por dia da semana"],
-            ["hora", "Por hora"],
-            ["dia", "Dia a dia"],
-          ].map(([k, rot]) => (
-            <button
-              key={k}
-              onClick={() => setAba(k)}
-              style={{
-                padding: "6px 12px",
-                borderRadius: 6,
-                border: "1px solid var(--border, rgba(255,255,255,0.12))",
-                background: aba === k ? RAMPA[1] : "transparent",
-                color: aba === k ? "#fff" : "var(--muted)",
-                cursor: "pointer",
-                font: "inherit",
-              }}
-            >
-              {rot}
-            </button>
-          ))}
-        </div>
-
-        {aba === "matriz" && (
-          <>
-            {/* Legenda da rampa: sem ela a cor não significa nada */}
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                marginBottom: 10,
-                color: "var(--muted)",
-                fontSize: 12,
-              }}
-            >
-              <span>menos</span>
-              {RAMPA.map((c, i) => (
-                <span
-                  key={c}
-                  title={
-                    cortes
-                      ? i === 0
-                        ? `até ${fmtPct(cortes[0])}`
-                        : i === RAMPA.length - 1
-                        ? `acima de ${fmtPct(cortes[cortes.length - 1])}`
-                        : `${fmtPct(cortes[i - 1])} a ${fmtPct(cortes[i])}`
-                      : undefined
-                  }
-                  style={{ width: 26, height: 10, borderRadius: 2, background: c }}
-                />
-              ))}
-              <span>mais converte</span>
-              <span style={{ marginLeft: 12, display: "inline-flex", alignItems: "center", gap: 6 }}>
-                <span
-                  style={{
-                    width: 14,
-                    height: 10,
-                    borderRadius: 2,
-                    border: "1px dashed var(--muted)",
-                  }}
-                />
-                volume baixo
-              </span>
-            </div>
-
-            <div className="table-scroll">
-              <table className="day-table">
-                <thead>
-                  <tr>
-                    <th />
-                    {Array.from({ length: 24 }, (_, h) => (
-                      <th key={h} style={{ textAlign: "center", padding: "4px 2px", fontWeight: 400 }}>
-                        {String(h).padStart(2, "0")}
-                      </th>
-                    ))}
-                    <th style={{ textAlign: "right" }}>Dia</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {hist.matriz.map((linha, dow) => {
-                    const resumo = hist.porDiaSemana[dow];
-                    return (
-                      <tr key={dow}>
-                        <td style={{ whiteSpace: "nowrap", color: "var(--muted)" }}>
-                          {curto[dow]}
-                        </td>
-                        {linha.map((c) => {
-                          const pouco = c.criadas > 0 && c.criadas < VOLUME_MINIMO;
-                          const cor = pouco ? null : corDaFaixa(c.conversao, cortes);
-                          return (
-                            <td key={c.hora} style={{ padding: 2 }}>
-                              <div
-                                title={
-                                  c.criadas === 0
-                                    ? `${curto[dow]} ${hhmm(c.hora)} — nenhuma cobrança criada`
-                                    : `${curto[dow]} ${hhmm(c.hora)} — ${fmtPct(
-                                        c.conversao
-                                      )} · ${fmtNum(c.pagas)} de ${fmtNum(
-                                        c.criadas
-                                      )} · ${fmtMoney(c.receita)}${
-                                        pouco ? " · volume baixo, cor suprimida" : ""
-                                      }`
-                                }
-                                style={{
-                                  width: 22,
-                                  height: 22,
-                                  borderRadius: 4,
-                                  background: cor || "transparent",
-                                  border: pouco
-                                    ? "1px dashed var(--muted)"
-                                    : cor
-                                    ? "none"
-                                    : "1px solid rgba(255,255,255,0.07)",
-                                }}
-                              />
-                            </td>
-                          );
-                        })}
-                        <td
-                          style={{
-                            textAlign: "right",
-                            whiteSpace: "nowrap",
-                            fontVariantNumeric: "tabular-nums",
-                          }}
-                        >
-                          {fmtPct(resumo.conversao)}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                  <tr>
-                    <td style={{ color: "var(--muted)" }}>hora</td>
-                    {hist.porHora.map((h) => (
-                      <td
-                        key={h.hora}
-                        style={{
-                          padding: "4px 2px",
-                          textAlign: "center",
-                          fontSize: 10,
-                          color: "var(--muted)",
-                          fontVariantNumeric: "tabular-nums",
-                        }}
-                        title={`${hhmm(h.hora)} — ${fmtNum(h.pagas)} de ${fmtNum(h.criadas)}`}
-                      >
-                        {h.conversao == null ? "—" : Math.round(h.conversao * 100)}
-                      </td>
-                    ))}
-                    <td style={{ textAlign: "right" }}>{fmtPct(hist.total.conversao)}</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </>
-        )}
-
-        {aba === "dow" && (
-          <div className="table-scroll">
-            <table className="day-table">
-              <thead>
-                <tr>
-                  <th>Dia da semana</th>
-                  <th>Dias na base</th>
-                  <th>Criadas</th>
-                  <th>Pagas</th>
-                  <th>Conversão</th>
-                  <th>Receita</th>
-                  <th>Ticket</th>
-                </tr>
-              </thead>
-              <tbody>
-                {[1, 2, 3, 4, 5, 6, 0].map((dow) => {
-                  const r = hist.porDiaSemana[dow];
-                  return (
-                    <tr key={dow}>
-                      <td>{r.nome}</td>
-                      <td>{fmtNum(r.diasNaBase)}</td>
-                      <td>{fmtNum(r.criadas)}</td>
-                      <td>{fmtNum(r.pagas)}</td>
-                      <td style={{ fontVariantNumeric: "tabular-nums" }}>
-                        {fmtPct(r.conversao)}
-                      </td>
-                      <td>{fmtMoney(r.receita)}</td>
-                      <td>{r.ticket == null ? "—" : fmtMoney(r.ticket)}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-
-        {aba === "hora" && (
-          <div className="table-scroll">
-            <table className="day-table">
-              <thead>
-                <tr>
-                  <th>Hora</th>
-                  <th>Criadas</th>
-                  <th>Pagas</th>
-                  <th>Conversão</th>
-                  <th>Receita</th>
-                  <th>Ticket</th>
-                </tr>
-              </thead>
-              <tbody>
-                {hist.porHora.map((r) => (
-                  <tr key={r.hora}>
-                    <td>{hhmm(r.hora)}</td>
-                    <td>{fmtNum(r.criadas)}</td>
-                    <td>{fmtNum(r.pagas)}</td>
-                    <td style={{ fontVariantNumeric: "tabular-nums" }}>
-                      {fmtPct(r.conversao)}
-                    </td>
-                    <td>{fmtMoney(r.receita)}</td>
-                    <td>{r.ticket == null ? "—" : fmtMoney(r.ticket)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-
-        {aba === "dia" && (
-          <div className="table-scroll">
-            <table className="day-table">
-              <thead>
-                <tr>
-                  <th>Dia</th>
-                  <th>Criadas</th>
-                  <th>Pagas</th>
-                  <th>Conversão</th>
-                  <th>Receita</th>
-                  <th>Ticket</th>
-                </tr>
-              </thead>
-              <tbody>
-                {hist.porDia
-                  .slice()
-                  .reverse()
-                  .map((r) => (
-                    <tr key={r.dia}>
-                      <td style={{ whiteSpace: "nowrap" }}>
-                        {r.dia.slice(8, 10)}/{r.dia.slice(5, 7)}{" "}
-                        <span style={{ color: "var(--muted)" }}>{curto[r.dow]}</span>
-                      </td>
-                      <td>{fmtNum(r.criadas)}</td>
-                      <td>{fmtNum(r.pagas)}</td>
-                      <td style={{ fontVariantNumeric: "tabular-nums" }}>
-                        {fmtPct(r.conversao)}
-                      </td>
-                      <td>{fmtMoney(r.receita)}</td>
-                      <td>{r.ticket == null ? "—" : fmtMoney(r.ticket)}</td>
-                    </tr>
-                  ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-    </>
+  const tabela = process.env.DB_TX_TABLE || "public.transactions";
+  const dias = Math.min(
+    180,
+    Math.max(7, Number(searchParams.get("dias") || process.env.HORAS_DIAS_PADRAO || 28))
   );
+  // "hoje" é sempre hoje em Brasília, não a data do filtro da tela
+  const hojeISO =
+    searchParams.get("hoje") || new Date().toLocaleDateString("en-CA", { timeZone: TZ });
+
+  const de = new Date(`${hojeISO}T12:00:00Z`);
+  de.setUTCDate(de.getUTCDate() - dias);
+  const deISO = de.toISOString().slice(0, 10);
+
+  const { Client } = await import("pg");
+  const client = new Client({
+    connectionString: process.env.DATABASE_URL,
+    ssl: /sslmode=disable/.test(process.env.DATABASE_URL || "")
+      ? false
+      : { rejectUnauthorized: false },
+  });
+
+  try {
+    await client.connect();
+    const cols = await detectaColunas(client, tabela);
+    const { rows } = await client.query(buildHorasSql(tabela, cols), [
+      deISO,
+      hojeISO,
+      STATUS_IGNORA,
+      STATUS_PAGOS,
+    ]);
+    const payload = montaHorasPayload(rows, hojeISO, dias);
+    payload.de = deISO;
+    payload.ate = hojeISO;
+    payload.tabela = tabela;
+    payload.colunas = cols;
+    payload.statusPagos = STATUS_PAGOS;
+    payload.statusIgnorados = STATUS_IGNORA;
+    if (!cols.valor) {
+      payload.aviso = `a tabela ${tabela} não tem coluna de valor — receita e ticket ficam zerados; a conversão continua certa.`;
+    }
+    return NextResponse.json(payload, { headers: { "Cache-Control": "no-store" } });
+  } catch (e) {
+    return NextResponse.json(
+      { erro: String(e?.message || e) },
+      { status: 500, headers: { "Cache-Control": "no-store" } }
+    );
+  } finally {
+    await client.end().catch(() => {});
+  }
 }
