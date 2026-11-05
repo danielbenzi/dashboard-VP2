@@ -28,34 +28,62 @@ const RAMPA = ["#184f95", "#256abf", "#3987e5", "#6da7ec", "#9ec5f4"];
 // é 100% e não quer dizer nada. Fica com hachura e sai do cálculo das faixas.
 const VOLUME_MINIMO = 5;
 
-let _cache = null;
-function useHoras() {
-  const [d, setD] = useState(_cache);
-  const [err, setErr] = useState(null);
-  const [loading, setLoading] = useState(!_cache);
+// Store compartilhado entre as duas seções: UMA chamada por ciclo, não duas.
+// Recarrega sozinho a cada 5 min e quando a aba volta ao foco — a página
+// principal só atualiza no botão, mas aqui o número muda a cada hora.
+const INTERVALO_MS = 5 * 60 * 1000;
+const store = { d: null, err: null, loading: false, at: null, subs: new Set(), timer: null };
+const notifica = () => store.subs.forEach((fn) => fn());
 
+async function carregaHoras() {
+  if (store.loading) return;
+  store.loading = true;
+  notifica();
+  try {
+    const r = await fetch("/api/dashboard/horas", { cache: "no-store" });
+    const j = await r.json();
+    if (j.erro) store.err = j.erro;
+    else {
+      store.d = j;
+      store.err = null;
+      store.at = new Date();
+    }
+  } catch (e) {
+    store.err = e.message;
+  } finally {
+    store.loading = false;
+    notifica();
+  }
+}
+
+function useHoras() {
+  const [, force] = useState(0);
   useEffect(() => {
-    if (_cache) return;
-    let vivo = true;
-    fetch("/api/dashboard/horas", { cache: "no-store" })
-      .then((r) => r.json())
-      .then((j) => {
-        if (!vivo) return;
-        if (j.erro) setErr(j.erro);
-        else {
-          _cache = j;
-          setD(j);
-        }
-      })
-      .catch((e) => vivo && setErr(e.message))
-      .finally(() => vivo && setLoading(false));
+    const fn = () => force((n) => n + 1);
+    store.subs.add(fn);
+    if (!store.d && !store.loading) carregaHoras();
+    if (!store.timer) {
+      store.timer = setInterval(carregaHoras, INTERVALO_MS);
+      document.addEventListener("visibilitychange", onVisivel);
+    }
     return () => {
-      vivo = false;
+      store.subs.delete(fn);
+      if (store.subs.size === 0 && store.timer) {
+        clearInterval(store.timer);
+        store.timer = null;
+        document.removeEventListener("visibilitychange", onVisivel);
+      }
     };
   }, []);
-
-  return { d, err, loading };
+  return { d: store.d, err: store.err, loading: store.loading && !store.d, at: store.at, recarrega: carregaHoras };
 }
+function onVisivel() {
+  if (document.visibilityState !== "visible" || !store.at) return;
+  if (Date.now() - store.at.getTime() > 60 * 1000) carregaHoras();
+}
+
+const fmtHoraAt = (dt) =>
+  dt ? dt.toLocaleTimeString("pt-BR", { timeZone: "America/Sao_Paulo", hour: "2-digit", minute: "2-digit" }) : "";
 
 const hhmm = (h) => String(h).padStart(2, "0") + "h";
 
@@ -79,7 +107,7 @@ const corDaFaixa = (valor, cortes) => {
 };
 
 export function ConversaoHojeSection() {
-  const { d, err, loading } = useHoras();
+  const { d, err, loading, at, recarrega } = useHoras();
   const horas = d?.hoje?.horas || [];
   // O máximo da barra ignora as horas de amostra baixa: uma hora com 1 de 1
   // paga marcaria 100% e esmagaria todas as barras reais contra o zero.
@@ -114,6 +142,19 @@ export function ConversaoHojeSection() {
               {fmtPct(d.hoje.total.conversao)} no dia ({fmtNum(d.hoje.total.pagas)} de{" "}
               {fmtNum(d.hoje.total.criadas)})
             </strong>
+            <span style={{ marginLeft: 10, color: "var(--muted)", fontSize: 12 }}>
+              atualizado às {fmtHoraAt(at)} ·{" "}
+              <a
+                href="#"
+                onClick={(e) => {
+                  e.preventDefault();
+                  recarrega();
+                }}
+                style={{ color: "inherit" }}
+              >
+                atualizar
+              </a>
+            </span>
             <div style={{ marginTop: 4 }}>
               A hora é a da <strong>criação</strong> da cobrança, não a do pagamento:
               uma cobrança criada 14h50 e paga 15h10 conta inteira nas 14h — é o que
