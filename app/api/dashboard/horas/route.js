@@ -15,8 +15,8 @@
 //
 // Variáveis de ambiente (todas opcionais menos DATABASE_URL, que você já tem):
 //   DB_TX_TABLE       = public.transactions
-//   DB_STATUS_PAGOS   = paid,approved
-//   DB_STATUS_IGNORA  = refunded,chargeback
+//   DB_PAID_STATUSES    = paid,approved      (mesmas envs do route.js principal)
+//   DB_IGNORED_STATUSES = refunded,chargeback
 //   HORAS_DIAS_PADRAO = 28
 
 import { NextResponse } from "next/server";
@@ -30,10 +30,13 @@ const DOW_NOMES = ["Domingo", "Segunda", "Terça", "Quarta", "Quinta", "Sexta", 
 const DOW_CURTO = ["dom", "seg", "ter", "qua", "qui", "sex", "sáb"];
 
 const listaEnv = (nome, padrao) =>
-  (process.env[nome] || padrao).split(",").map((s) => s.trim()).filter(Boolean);
+  (process.env[nome] || padrao)
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
 
-const STATUS_PAGOS = listaEnv("DB_STATUS_PAGOS", "paid,approved");
-const STATUS_IGNORA = listaEnv("DB_STATUS_IGNORA", "refunded,chargeback");
+const STATUS_PAGOS = listaEnv("DB_PAID_STATUSES", "paid,approved");
+const STATUS_IGNORA = listaEnv("DB_IGNORED_STATUSES", "refunded,chargeback");
 
 // Descobre as colunas em tempo de execução. O schema não está versionado aqui,
 // então chutar nome de coluna é como a gente já se queimou antes.
@@ -80,7 +83,8 @@ export function exprHoraLocal(col, tipo) {
 export function buildHorasSql(tabela, cols) {
   const ts = exprHoraLocal(cols.data, cols.dataTipo);
   const valor = cols.valor ? `COALESCE("${cols.valor}", 0)::numeric` : `0::numeric`;
-  const st = `"${cols.status}"`;
+  // status normalizado: o banco guarda "PAID", a env diz "paid"
+  const st = `lower(COALESCE("${cols.status}"::text, ''))`;
   return `
     WITH base AS (
       SELECT ${ts} AS ts, ${st} AS status, ${valor} AS valor
