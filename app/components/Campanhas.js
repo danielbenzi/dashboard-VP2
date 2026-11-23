@@ -101,7 +101,16 @@ function Linhas({ linhas, rotulo, alvo, chaveId }) {
               <td style={{ whiteSpace: "nowrap" }}>
                 {l.__rot ?? l[chaveId]}
                 {l.__sub && (
-                  <div style={{ color: "var(--muted)", fontSize: 11 }}>{l.__sub}</div>
+                  <div
+                    style={{
+                      color: "var(--muted)",
+                      fontSize: 11,
+                      whiteSpace: "normal",
+                      maxWidth: 420,
+                    }}
+                  >
+                    {l.__sub}
+                  </div>
                 )}
               </td>
               <td className="neg">{fmtMoney(l.spend)}</td>
@@ -245,7 +254,7 @@ function Conteudo() {
 
             {aba === "campanhas" && (
               <>
-                <div className="legend" style={{ marginBottom: 8 }}>
+                <div className="legend" style={{ display: "block", marginBottom: 8 }}>
                   Ordenado por <strong>take rate</strong>, não por ROAS: uma campanha de
                   3,0x que gasta R$ 90 importa menos que uma de 1,42x que sobra R$ 5,7 mil.
                 </div>
@@ -264,7 +273,7 @@ function Conteudo() {
 
             {aba === "produto" && (
               <>
-                <div className="legend" style={{ marginBottom: 8 }}>
+                <div className="legend" style={{ display: "block", marginBottom: 8 }}>
                   ROAS por produto só existe para as campanhas que <strong>nomeiam</strong> o
                   produto. A transação guarda o identificador de clique, não o utm_campaign —
                   sem isso não há caminho de uma venda até a campanha dentro do banco. As
@@ -302,7 +311,7 @@ function Conteudo() {
 
             {aba === "banco" && (
               <>
-                <div className="legend" style={{ marginBottom: 8 }}>
+                <div className="legend" style={{ display: "block", marginBottom: 8 }}>
                   Estes números vêm do <strong>Postgres</strong>, por data de pagamento: é o
                   caixa, sem atribuição nenhuma. Não têm gasto nem ROAS de propósito —
                   servem para ver o que mais vende e com que ticket.
