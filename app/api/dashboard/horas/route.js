@@ -46,8 +46,10 @@ const DOW_CURTO = ["dom", "seg", "ter", "qua", "qui", "sex", "sáb"];
 const listaEnv = (n, p) =>
   (process.env[n] || p).split(",").map((s) => s.trim()).filter(Boolean);
 
-const STATUS_PAGOS = listaEnv("DB_STATUS_PAGOS", "paid,approved");
-const STATUS_IGNORA = listaEnv("DB_STATUS_IGNORA", "refunded,chargeback");
+// Minúsculas dos dois lados da comparação — ver normStatus() abaixo.
+const minusc = (a) => a.map((s) => s.toLowerCase());
+const STATUS_PAGOS = minusc(listaEnv("DB_STATUS_PAGOS", "paid,approved"));
+const STATUS_IGNORA = minusc(listaEnv("DB_STATUS_IGNORA", "refunded,chargeback"));
 const DIVISOR = Number(process.env.DB_AMOUNT_DIVISOR || 100) || 1;
 const TOLERANCIA = Number(process.env.HORAS_TOLERANCIA_CUSTO || 0.05);
 
@@ -94,12 +96,20 @@ export function exprHoraLocal(col, tipo) {
   return `((${q} AT TIME ZONE 'UTC') AT TIME ZONE '${TZ}')`;
 }
 
+// O status é NORMALIZADO dos dois lados — minúsculas e sem espaços em volta.
+// Comparar o valor cru contra 'paid' deu pagas = 0 em produção enquanto a rota
+// principal, que normaliza, contava 375 no mesmo dia e na mesma tabela. Um
+// 'PAID' ou ' paid ' no banco some inteiro de uma comparação literal, e some
+// SÓ do numerador: o denominador usa NOT(...) e continua contando a linha.
+// Resultado: conversão 0% com criadas certas, que foi exatamente o sintoma.
+const normStatus = (col) => `lower(btrim(${col}::text))`;
+
 export function buildHorasSql(tabela, cols, divisor = DIVISOR) {
   const ts = exprHoraLocal(cols.data, cols.dataTipo);
   const valor = cols.valor
     ? `(COALESCE("${cols.valor}", 0)::numeric / ${divisor})`
     : `0::numeric`;
-  const st = `"${cols.status}"`;
+  const st = normStatus(`"${cols.status}"`);
   return `
     WITH base AS (
       SELECT ${ts} AS ts, ${st} AS status, ${valor} AS valor
@@ -117,6 +127,20 @@ export function buildHorasSql(tabela, cols, divisor = DIVISOR) {
     FROM base
     GROUP BY 1, 2, 3
     ORDER BY 1, 3`;
+}
+
+// Diagnóstico: quais status existem de verdade na janela, e quantos. Sai no
+// payload para nunca mais eu ficar adivinhando o que o banco guarda.
+export function buildStatusSql(tabela, cols) {
+  const ts = exprHoraLocal(cols.data, cols.dataTipo);
+  return `
+    SELECT ${normStatus(`"${cols.status}"`)} AS status, count(*) AS linhas
+      FROM ${tabela}
+     WHERE ${ts} >= $1::timestamp
+       AND ${ts} <  ($2::timestamp + interval '1 day')
+     GROUP BY 1
+     ORDER BY 2 DESC
+     LIMIT 20`;
 }
 
 // ---------------------------------------------------------------- Windsor
@@ -360,10 +384,30 @@ export async function GET(request) {
     const cols = await detectaColunas(client, tabela);
 
     // banco e Windsor em paralelo: um não espera o outro
-    const [db, gasto] = await Promise.all([
+    const [db, statusDb, gasto] = await Promise.all([
       client.query(buildHorasSql(tabela, cols), [deISO, hojeISO, STATUS_IGNORA, STATUS_PAGOS]),
+      client.query(buildStatusSql(tabela, cols), [deISO, hojeISO]),
       fetchGastoPorHora(deISO, hojeISO, ctrl.signal),
     ]);
+
+    const statusVistos = statusDb.rows.map((r) => ({
+      status: r.status,
+      linhas: Number(r.linhas),
+    }));
+    // Se nenhum status da janela está na lista de pagos, a conversão sairia 0%
+    // com criadas certas — o sintoma mais traiçoeiro que existe aqui, porque
+    // parece queda de vendas em vez de bug.
+    const algumPago = statusVistos.some((s) => STATUS_PAGOS.includes(s.status));
+    if (statusVistos.length && !algumPago) {
+      avisos.push(
+        `Nenhuma linha com status ${STATUS_PAGOS.join(" ou ")} nesta janela. ` +
+          `O que existe na tabela é: ${statusVistos
+            .slice(0, 6)
+            .map((s) => `${s.status} (${s.linhas})`)
+            .join(", ")}. ` +
+          `Ajuste DB_STATUS_PAGOS — a conversão está 0% por causa disso, não por queda de vendas.`
+      );
+    }
 
     if (gasto.erro) avisos.push(`Custo do Google Ads indisponível: ${gasto.erro}`);
     const conferencia = conferecusto(gasto);
@@ -391,6 +435,7 @@ export async function GET(request) {
     payload.divisorValor = DIVISOR;
     payload.statusPagos = STATUS_PAGOS;
     payload.statusIgnorados = STATUS_IGNORA;
+    payload.statusVistos = statusVistos;
     payload.custo = { confiavel: custoOk, ...conferencia };
     payload.avisos = avisos;
     if (!cols.valor) {
