@@ -155,12 +155,23 @@ export async function fetchGastoPorHora(from, to, sinal) {
     process.env.GADS_ACCOUNT_PROCESSO || "Verifica Processo",
     process.env.GADS_ACCOUNT_PLACA || "Verifica Placa",
   ];
+  // O Windsor guarda a resposta de CADA URL de conector por 6 HORAS. Sem pedir
+  // refresh, a chamada volta do cache e as últimas horas do dia chegam SEM
+  // gasto — justamente as horas que interessam para decidir lance agora.
+  // `refresh_since` diz qual janela recente reprocessar e `refresh_interval`
+  // de quanto em quanto tempo. Mesmas envs que a rota principal já usa, para
+  // uma configuração só governar as duas.
+  const refreshSince = process.env.WINDSOR_REFRESH_SINCE || "3d";
+  const refreshInterval = process.env.WINDSOR_REFRESH_INTERVAL || "1h";
+
   const base = "https://connectors.windsor.ai/google_ads";
   const url =
     `${base}?api_key=${encodeURIComponent(key)}` +
     `&date_from=${from}&date_to=${to}` +
     `&fields=date,hour_of_day,account_name,spend` +
-    `&_renderer=json`;
+    `&_renderer=json` +
+    `&refresh_since=${encodeURIComponent(refreshSince)}` +
+    `&refresh_interval=${encodeURIComponent(refreshInterval)}`;
 
   let json;
   try {
@@ -436,7 +447,31 @@ export async function GET(request) {
     payload.statusPagos = STATUS_PAGOS;
     payload.statusIgnorados = STATUS_IGNORA;
     payload.statusVistos = statusVistos;
-    payload.custo = { confiavel: custoOk, ...conferencia };
+    // Até que hora do dia de hoje o Windsor já entregou gasto. Sem isso, as
+    // horas recentes apareceriam com "—" sem explicação e pareceria bug.
+    let ultimaHoraComCusto = -1;
+    for (let h = 0; h < 24; h++) {
+      if ((gasto.porHora.get(`${hojeISO}|${h}`) || 0) > 0) ultimaHoraComCusto = h;
+    }
+    const horasSemCusto = payload.hoje.horas.filter(
+      (h) => h.hora > ultimaHoraComCusto && h.criadas > 0
+    );
+    if (custoOk && horasSemCusto.length) {
+      avisos.push(
+        `O gasto do Google Ads chegou até as ${String(ultimaHoraComCusto).padStart(2, "0")}h. ` +
+          `As ${horasSemCusto.length} hora(s) depois disso já têm cobranças mas ainda não têm custo — ` +
+          `o Windsor atualiza com atraso. Conversão, receita e ticket dessas horas estão certos; ` +
+          `custo, take rate e ROAS aparecem quando o gasto chegar.`
+      );
+    }
+
+    payload.custo = {
+      confiavel: custoOk,
+      ultimaHoraComCusto,
+      refreshSince: process.env.WINDSOR_REFRESH_SINCE || "3d",
+      refreshInterval: process.env.WINDSOR_REFRESH_INTERVAL || "1h",
+      ...conferencia,
+    };
     payload.avisos = avisos;
     if (!cols.valor) {
       payload.avisos.push(
