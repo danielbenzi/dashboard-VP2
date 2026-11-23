@@ -52,6 +52,9 @@ const STATUS_PAGOS = minusc(listaEnv("DB_STATUS_PAGOS", "paid,approved"));
 const STATUS_IGNORA = minusc(listaEnv("DB_STATUS_IGNORA", "refunded,chargeback"));
 const DIVISOR = Number(process.env.DB_AMOUNT_DIVISOR || 100) || 1;
 const TOLERANCIA = Number(process.env.HORAS_TOLERANCIA_CUSTO || 0.05);
+// Uma hora cujo gasto por cobrança criada fica abaixo desta fração da mediana
+// do dia está com o custo ainda chegando, não barata de verdade.
+const LIMIAR_PARCIAL = Number(process.env.HORAS_LIMIAR_PARCIAL || 0.6);
 
 const num = (v) => {
   const n = Number(v);
@@ -447,27 +450,83 @@ export async function GET(request) {
     payload.statusPagos = STATUS_PAGOS;
     payload.statusIgnorados = STATUS_IGNORA;
     payload.statusVistos = statusVistos;
-    // Até que hora do dia de hoje o Windsor já entregou gasto. Sem isso, as
-    // horas recentes apareceriam com "—" sem explicação e pareceria bug.
+    // ---- custo ainda chegando: a hora PARECE barata e o ROAS sai inflado ----
+    //
+    // O Google Ads reporta a hora com atraso. A hora recente volta com parte
+    // do gasto, a receita já está inteira, e o ROAS sai alto — 3,44x do lado
+    // de vizinhos em 1,45x. Verde, convidativo e falso.
+    //
+    // A detecção não usa hora de corte fixa (o atraso varia). Usa o próprio
+    // dado: o gasto por cobrança criada é estável ao longo do dia, porque são
+    // as mesmas campanhas. Se uma hora está muito abaixo da MEDIANA do dia, o
+    // gasto dela não chegou inteiro. Mediana, não média, para a própria hora
+    // furada não puxar a referência.
+    // O atraso chega EM ORDEM: afeta a cauda do dia, nunca um buraco no meio.
+    // Por isso a varredura é de trás para frente e PARA na primeira hora
+    // saudável. Sem isso, a madrugada — que é barata de verdade, R$ 4,38 por
+    // cobrança criada contra mediana de R$ 8 — seria marcada junto.
+    const marcaParciais = (horas) => {
+      const razoes = horas
+        .filter((h) => h.criadas > 0 && h.custo > 0)
+        .map((h) => h.custo / h.criadas)
+        .sort((a, b) => a - b);
+      if (razoes.length < 4) return { mediana: null, parciais: 0 };
+      const mediana = razoes[Math.floor(razoes.length / 2)];
+      const piso = mediana * LIMIAR_PARCIAL;
+
+      const marca = (h) => {
+        h.custoParcial = true;
+        // o custo medido até agora continua visível; some o que depende dele
+        // como se fosse final
+        h.takeRate = null;
+        h.roas = null;
+        h.cpa = null;
+      };
+
+      let parciais = 0;
+      for (let i = horas.length - 1; i >= 0; i--) {
+        const h = horas[i];
+        if (!(h.criadas > 0)) continue; // hora que nem começou: segue a cauda
+        const semCusto = !(h.custo > 0);
+        const abaixo = !semCusto && h.custo / h.criadas < piso;
+        if (!semCusto && !abaixo) break; // primeira hora sadia: fim da cauda
+        marca(h);
+        parciais++;
+      }
+      return { mediana: r2(mediana), piso: r2(piso), parciais };
+    };
+
+    const parcial = custoOk
+      ? marcaParciais(payload.hoje.horas)
+      : { mediana: null, parciais: 0 };
+
+    // o total do dia também não pode somar ROAS com custo pela metade
+    if (parcial.parciais > 0) {
+      const t = payload.hoje.total;
+      t.custoParcial = true;
+      t.takeRate = null;
+      t.roas = null;
+      t.cpa = null;
+      avisos.push(
+        `${parcial.parciais} hora(s) de hoje ainda estão recebendo o gasto do Google Ads. ` +
+          `Nelas o custo aparece como parcial e ROAS, take rate e CPA ficam em "—": com o gasto ` +
+          `pela metade o ROAS sairia alto demais e pareceria a melhor hora do dia. ` +
+          `Conversão, receita e ticket dessas horas estão corretos.`
+      );
+    }
+
     let ultimaHoraComCusto = -1;
     for (let h = 0; h < 24; h++) {
       if ((gasto.porHora.get(`${hojeISO}|${h}`) || 0) > 0) ultimaHoraComCusto = h;
     }
-    const horasSemCusto = payload.hoje.horas.filter(
-      (h) => h.hora > ultimaHoraComCusto && h.criadas > 0
-    );
-    if (custoOk && horasSemCusto.length) {
-      avisos.push(
-        `O gasto do Google Ads chegou até as ${String(ultimaHoraComCusto).padStart(2, "0")}h. ` +
-          `As ${horasSemCusto.length} hora(s) depois disso já têm cobranças mas ainda não têm custo — ` +
-          `o Windsor atualiza com atraso. Conversão, receita e ticket dessas horas estão certos; ` +
-          `custo, take rate e ROAS aparecem quando o gasto chegar.`
-      );
-    }
 
+    payload.geradoEm = new Date().toISOString();
     payload.custo = {
       confiavel: custoOk,
       ultimaHoraComCusto,
+      horasParciais: parcial.parciais,
+      medianaCustoPorCriada: parcial.mediana,
+      pisoCustoPorCriada: parcial.piso ?? null,
       refreshSince: process.env.WINDSOR_REFRESH_SINCE || "3d",
       refreshInterval: process.env.WINDSOR_REFRESH_INTERVAL || "1h",
       ...conferencia,
