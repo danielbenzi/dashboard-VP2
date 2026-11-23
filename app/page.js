@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CampanhasSection } from "./components/Campanhas";
+import Link from "next/link";
 import { ConversaoHojeSection, ConversaoHistoricoSection } from "./components/ConversaoHoras";
 
 const BRL = new Intl.NumberFormat("pt-BR", {
@@ -150,6 +150,12 @@ export default function Page() {
 
   return (
     <div className="wrap">
+      <nav className="abas">
+        <span className="aba ativa">Visão geral</span>
+        <Link className="aba" href="/campanhas">
+          Campanhas
+        </Link>
+      </nav>
       <div className="topbar">
         <div className="title">
           <h1>Verifica Processo &amp; Verifica Placa</h1>
@@ -238,7 +244,6 @@ export default function Page() {
           <ProjecaoSection />
           <ConversaoHojeSection />
           <ConversaoHistoricoSection />
-          <CampanhasSection />
           <MonthlySection />
           <RepeatSection />
         </>

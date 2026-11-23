@@ -286,3 +286,26 @@ body {
   margin: 6px 0 0;
   padding-left: 18px;
 }
+
+/* Navegação entre páginas (Visão geral / Campanhas) */
+.abas {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+}
+.abas .aba {
+  padding: 8px 14px;
+  font-size: 14px;
+  color: var(--muted);
+  text-decoration: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.abas .aba:hover {
+  color: var(--text);
+}
+.abas .aba.ativa {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
