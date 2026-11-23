@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { CampanhasSection } from "./components/Campanhas";
 import { ConversaoHojeSection, ConversaoHistoricoSection } from "./components/ConversaoHoras";
 
 const BRL = new Intl.NumberFormat("pt-BR", {
@@ -237,6 +238,7 @@ export default function Page() {
           <ProjecaoSection />
           <ConversaoHojeSection />
           <ConversaoHistoricoSection />
+          <CampanhasSection />
           <MonthlySection />
           <RepeatSection />
         </>
