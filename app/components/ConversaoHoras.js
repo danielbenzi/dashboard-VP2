@@ -8,7 +8,37 @@
 //
 // As duas compartilham o mesmo fetch: /api/dashboard/horas é chamada UMA vez.
 
-import { useEffect, useMemo, useState } from "react";
+import { Component, useEffect, useMemo, useState } from "react";
+
+// Se qualquer coisa aqui dentro quebrar, quebra SÓ aqui. Sem isso, um erro
+// nesta seção derruba a página inteira do Next e você perde o dashboard de
+// receita por causa de uma tabela de conversão.
+class Isola extends Component {
+  constructor(p) {
+    super(p);
+    this.state = { erro: null };
+  }
+  static getDerivedStateFromError(erro) {
+    return { erro };
+  }
+  componentDidCatch(erro, info) {
+    console.error("[ConversaoHoras] quebrou:", erro, info);
+  }
+  render() {
+    if (this.state.erro) {
+      return (
+        <div className="table-card" style={{ color: "var(--muted)", fontSize: 13 }}>
+          <strong style={{ color: "var(--amber)" }}>
+            {this.props.titulo || "Esta seção"} não carregou.
+          </strong>{" "}
+          O resto do dashboard continua funcionando. Erro:{" "}
+          <code>{String(this.state.erro?.message || this.state.erro)}</code>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 const BRL = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
 const NUM = new Intl.NumberFormat("pt-BR");
@@ -32,36 +62,95 @@ const ROAS_ALVO = 1.4;
 
 // ------------------------------------------------------------- dados
 
-let store = { dados: null, ouvintes: new Set(), buscando: false };
+const store = { dados: null, em: null, ouvintes: new Set(), buscando: false };
 
+// Sem isso a tela busca uma vez e congela: às 13h14 a linha das 13h aparecia
+// vazia porque o dado era de antes das 13h.
+const INTERVALO_MS = 5 * 60 * 1000;
+
+function carrega(forcar) {
+  if (store.buscando) return;
+  if (!forcar && store.dados && Date.now() - (store.em || 0) < INTERVALO_MS) return;
+  store.buscando = true;
+  store.ouvintes.forEach((f) => f());
+  fetch("/api/dashboard/horas", { cache: "no-store" })
+    .then((r) => r.json())
+    .then((j) => {
+      store.dados = j && typeof j === "object" ? j : { erro: "resposta inesperada" };
+    })
+    .catch((e) => {
+      store.dados = { erro: String(e?.message || e) };
+    })
+    .finally(() => {
+      store.buscando = false;
+      store.em = Date.now();
+      store.ouvintes.forEach((f) => f());
+    });
+}
+
+// O primeiro render é SEMPRE "carregando", no servidor e no cliente. Ler o
+// store direto no corpo do componente fazia a marcação do servidor diferir da
+// do cliente, e no Next uma divergência dessas derruba a página inteira.
 function useHoras() {
-  const [, forca] = useState(0);
+  const [estado, setEstado] = useState({
+    d: null,
+    err: null,
+    loading: true,
+    buscando: false,
+    em: null,
+  });
 
   useEffect(() => {
-    const ouvinte = () => forca((n) => n + 1);
-    store.ouvintes.add(ouvinte);
+    let vivo = true;
+    const aplica = () => {
+      if (!vivo) return;
+      const d = store.dados;
+      setEstado({
+        d: d?.erro ? null : d,
+        err: d?.erro || null,
+        loading: !d && store.buscando,
+        buscando: store.buscando,
+        em: store.em,
+      });
+    };
+    store.ouvintes.add(aplica);
+    carrega(false);
+    aplica();
 
-    if (!store.dados && !store.buscando) {
-      store.buscando = true;
-      fetch("/api/dashboard/horas", { cache: "no-store" })
-        .then((r) => r.json())
-        .then((j) => {
-          store.dados = j.erro ? { erro: j.erro } : j;
-        })
-        .catch((e) => {
-          store.dados = { erro: e.message };
-        })
-        .finally(() => {
-          store.buscando = false;
-          store.ouvintes.forEach((f) => f());
-        });
-    }
-    return () => store.ouvintes.delete(ouvinte);
+    // relógio: redesenha a cada minuto e rebusca quando o dado envelhece
+    const t = setInterval(() => {
+      carrega(false);
+      aplica();
+    }, 60 * 1000);
+    // voltou para a aba depois de um tempo? rebusca
+    const aoVoltar = () => {
+      if (document.visibilityState === "visible") carrega(false);
+    };
+    document.addEventListener("visibilitychange", aoVoltar);
+
+    return () => {
+      vivo = false;
+      clearInterval(t);
+      document.removeEventListener("visibilitychange", aoVoltar);
+      store.ouvintes.delete(aplica);
+    };
   }, []);
 
-  const d = store.dados;
-  return { d: d?.erro ? null : d, err: d?.erro || null, loading: !d };
+  return { ...estado, recarregar: () => carrega(true) };
 }
+
+const hhmmRelogio = (ms) =>
+  !ms
+    ? "—"
+    : new Date(ms).toLocaleTimeString("pt-BR", {
+        timeZone: "America/Sao_Paulo",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+
+// Payload de versão antiga da rota (sem custo/avisos) não pode quebrar a tela.
+const temForma = (d) =>
+  !!d && Array.isArray(d?.hoje?.horas) && Array.isArray(d?.historico?.matriz);
 
 function Avisos({ d }) {
   if (!d?.avisos?.length) return null;
@@ -86,8 +175,9 @@ function Avisos({ d }) {
 
 // ------------------------------------------------------------- hoje
 
-export function ConversaoHojeSection() {
-  const { d, err, loading } = useHoras();
+function HojeSection() {
+  const { d: bruto, err, loading, buscando, em, recarregar } = useHoras();
+  const d = temForma(bruto) ? bruto : null;
   const horas = d?.hoje?.horas || [];
 
   // O máximo da barra ignora as horas de amostra baixa: uma hora com 1 de 1
@@ -97,11 +187,18 @@ export function ConversaoHojeSection() {
     0.0001
   );
 
-  const horaAtual = Number(
-    new Date()
-      .toLocaleString("en-CA", { timeZone: "America/Sao_Paulo", hour: "2-digit", hour12: false })
-      .slice(-2)
-  );
+  // Calculado só no cliente: `new Date()` no servidor daria uma marcação
+  // diferente da do navegador e a hidratação quebraria.
+  const [horaAtual, setHoraAtual] = useState(-1);
+  useEffect(() => {
+    const h = new Date().toLocaleString("en-CA", {
+      timeZone: "America/Sao_Paulo",
+      hour: "2-digit",
+      hour12: false,
+    });
+    const n = Number(String(h).slice(-2));
+    setHoraAtual(Number.isFinite(n) ? n % 24 : -1);
+  }, []);
 
   return (
     <>
@@ -112,6 +209,13 @@ export function ConversaoHojeSection() {
 
       {loading && <div className="table-card loading">Carregando…</div>}
       {err && <div className="banner">Conversão por hora indisponível: {err}</div>}
+      {!loading && !err && !d && (
+        <div className="table-card" style={{ color: "var(--muted)", fontSize: 13 }}>
+          A rota <code>/api/dashboard/horas</code> respondeu num formato que esta tela
+          não reconhece — quase sempre é o <strong>route.js desatualizado</strong> em
+          relação a este componente. Atualize os dois juntos.
+        </div>
+      )}
 
       {d && (
         <div className="table-card">
@@ -122,6 +226,25 @@ export function ConversaoHojeSection() {
               {fmtNum(d.hoje.total.criadas)}) · {fmtMoney(d.hoje.total.receita)}
               {d.hoje.total.roas != null && <> · ROAS {fmtRoas(d.hoje.total.roas)}</>}
             </strong>
+            <span style={{ marginLeft: 10, fontWeight: 400 }}>
+              atualizado às {hhmmRelogio(em)}
+              {" · "}
+              <button
+                onClick={recarregar}
+                disabled={buscando}
+                style={{
+                  background: "none",
+                  border: "none",
+                  padding: 0,
+                  font: "inherit",
+                  color: buscando ? "var(--muted)" : RAMPA[4],
+                  cursor: buscando ? "default" : "pointer",
+                  textDecoration: "underline",
+                }}
+              >
+                {buscando ? "atualizando…" : "atualizar"}
+              </button>
+            </span>
             <div style={{ marginTop: 4 }}>
               A hora é a da <strong>criação</strong> da cobrança, não a do pagamento:
               criada 14h50 e paga 15h10 conta inteira nas 14h. É o que responde qual
@@ -208,8 +331,19 @@ export function ConversaoHojeSection() {
                           </span>
                         )}
                       </td>
-                      <td className={h.custo > 0 ? "neg" : undefined}>
-                        {h.custo == null ? "—" : h.custo > 0 ? fmtMoney(h.custo) : "—"}
+                      <td
+                        className={h.custo > 0 && !h.custoParcial ? "neg" : undefined}
+                        style={h.custoParcial ? { color: "var(--muted)" } : undefined}
+                        title={
+                          h.custoParcial
+                            ? "o gasto desta hora ainda está chegando do Google Ads — ROAS e take rate ficam ocultos até fechar"
+                            : undefined
+                        }
+                      >
+                        {h.custo == null || !(h.custo > 0) ? "—" : fmtMoney(h.custo)}
+                        {h.custoParcial && h.custo > 0 && (
+                          <span style={{ fontSize: 11 }}> ·parcial</span>
+                        )}
                       </td>
                       <td>{h.receita > 0 ? fmtMoney(h.receita) : "—"}</td>
                       <td className={h.takeRate == null ? undefined : h.takeRate >= 0 ? "pos" : "neg"}>
@@ -326,13 +460,14 @@ function TabelaLinhas({ linhas, rotulo, chave }) {
   );
 }
 
-export function ConversaoHistoricoSection() {
-  const { d, err, loading } = useHoras();
+function HistoricoSection() {
+  const { d: bruto, err, loading } = useHoras();
   const [aba, setAba] = useState("matriz");
   const [metrica, setMetrica] = useState("conversao");
 
+  const d = temForma(bruto) ? bruto : null;
   const hist = d?.historico;
-  const M = METRICAS[metrica];
+  const M = METRICAS[metrica] || METRICAS.conversao;
 
   const cortes = useMemo(() => {
     if (!hist) return null;
@@ -340,13 +475,21 @@ export function ConversaoHistoricoSection() {
       hist.matriz
         .flat()
         .filter((c) => c.criadas >= VOLUME_MINIMO)
-        .map((c) => M.get(c))
+        .map((c) => METRICAS[metrica].get(c))
     );
   }, [hist, metrica]);
 
   if (loading) return <div className="table-card loading">Carregando…</div>;
   if (err) return null; // o erro já apareceu na seção de hoje
-  if (!hist) return null;
+  if (!hist) {
+    return (
+      <div className="table-card" style={{ color: "var(--muted)", fontSize: 13 }}>
+        A rota <code>/api/dashboard/horas</code> respondeu num formato que esta tela
+        não reconhece. Quase sempre é o <strong>route.js desatualizado</strong> em
+        relação a este componente — atualize os dois juntos.
+      </div>
+    );
+  }
 
   const curto = ["dom", "seg", "ter", "qua", "qui", "sex", "sáb"];
   const semCusto = !d.custo?.confiavel;
@@ -611,5 +754,22 @@ export function ConversaoHistoricoSection() {
         )}
       </div>
     </>
+  );
+}
+
+// Exportados já embrulhados: se quebrarem, quebram só a própria seção.
+export function ConversaoHojeSection() {
+  return (
+    <Isola titulo="Conversão de hoje, hora a hora">
+      <HojeSection />
+    </Isola>
+  );
+}
+
+export function ConversaoHistoricoSection() {
+  return (
+    <Isola titulo="Conversão por dia da semana e hora">
+      <HistoricoSection />
+    </Isola>
   );
 }
