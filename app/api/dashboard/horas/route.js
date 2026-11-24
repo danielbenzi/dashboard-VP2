@@ -30,7 +30,7 @@
 //   DB_STATUS_IGNORA     = refunded,chargeback
 //   DB_AMOUNT_DIVISOR    = 100
 //   HORAS_DIAS_PADRAO    = 28
-//   GADS_ACCOUNT_PROCESSO / GADS_ACCOUNT_PLACA
+//   GADS_ACCOUNT_PROCESSO
 //   HORAS_TOLERANCIA_CUSTO = 0.05
 
 import { NextResponse } from "next/server";
@@ -156,7 +156,6 @@ export async function fetchGastoPorHora(from, to, sinal) {
 
   const contas = [
     process.env.GADS_ACCOUNT_PROCESSO || "Verifica Processo",
-    process.env.GADS_ACCOUNT_PLACA || "Verifica Placa",
   ];
   // O Windsor guarda a resposta de CADA URL de conector por 6 HORAS. Sem pedir
   // refresh, a chamada volta do cache e as últimas horas do dia chegam SEM

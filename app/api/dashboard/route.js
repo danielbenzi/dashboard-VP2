@@ -1819,17 +1819,14 @@ async function fetchReceitaDoBanco(from, to, nomes, gran = "dia") {
     }
     const { rows } = await client.query(buildReceitaSql(DB_PAID_VIEW, c, gran), [from, to]);
 
-    // marca: se a view não distingue, tudo vai para a primeira e isso é dito
-    // em voz alta — número de marca errado é pior que número ausente.
+    // Só existe uma marca ativa (a Verifica Placa foi desligada): tudo vai
+    // para ela, com ou sem coluna de marca na view.
     const porMarca = Object.fromEntries(nomes.map((n) => [n, []]));
     const marcasVistas = new Set();
     for (const r of rows) {
       const marcaBruta = r.marca == null ? null : String(r.marca);
       if (marcaBruta) marcasVistas.add(marcaBruta);
-      const alvo =
-        (marcaBruta && /placa/i.test(marcaBruta) ? nomes[1] : null) ||
-        (marcaBruta && /processo/i.test(marcaBruta) ? nomes[0] : null) ||
-        nomes[0];
+      const alvo = nomes[0];
       porMarca[alvo].push({
         amount: num(r.receita) / DB_AMOUNT_DIVISOR,
         count: num(r.transacoes),
@@ -1880,11 +1877,7 @@ async function fetchFunilDoBanco(from, to, nomes, gran = "dia") {
 
     const porMarca = Object.fromEntries(nomes.map((n) => [n, []]));
     for (const r of rows) {
-      const marcaBruta = r.marca == null ? null : String(r.marca);
-      const alvo =
-        (marcaBruta && /placa/i.test(marcaBruta) ? nomes[1] : null) ||
-        (marcaBruta && /processo/i.test(marcaBruta) ? nomes[0] : null) ||
-        nomes[0];
+      const alvo = nomes[0];
       porMarca[alvo].push({
         source: rotuloGateway(r.gateway),
         date: String(r.dia),
@@ -1984,18 +1977,15 @@ async function debugFontes(from, to, nomes) {
   };
 
   const lixo = [];
-  const [banco, funil, abProc, abPlaca, stProc, stPlaca, pxProc, pxPlaca] = await Promise.all([
+  const [banco, funil, abProc, stProc, pxProc] = await Promise.all([
     fetchReceitaDoBanco(from, to, nomes).catch((e) => ({ erro: String(e?.message || e) })),
     fetchFunilDoBanco(from, to, nomes).catch((e) => ({ erro: String(e?.message || e) })),
     fetchAbacateTransactions(process.env.ABACATE_KEY_PROCESSO, from, to, lixo, "Processo", budget).catch(() => []),
-    fetchAbacateTransactions(process.env.ABACATE_KEY_PLACA, from, to, lixo, "Placa", budget).catch(() => []),
     fetchStripeTransactions(process.env.STRIPE_KEY_PROCESSO, from, to, lixo, "Processo", budget).catch(() => []),
-    fetchStripeTransactions(process.env.STRIPE_KEY_PLACA, from, to, lixo, "Placa", budget).catch(() => []),
     fetchPushinTransactions(process.env.PUSHIN_KEY_PROCESSO, from, to, lixo, "Processo", budget, null, lixo).catch(() => []),
-    fetchPushinTransactions(process.env.PUSHIN_KEY_PLACA, from, to, lixo, "Placa", budget, null, lixo).catch(() => []),
   ]);
 
-  const apiTx = [...abProc, ...abPlaca, ...stProc, ...stPlaca, ...pxProc, ...pxPlaca];
+  const apiTx = [...abProc, ...stProc, ...pxProc];
   const api = soma(apiTx);
   const bancoTx = banco.erro ? [] : Object.values(banco.porMarca).flat();
   const bd = soma(bancoTx);
@@ -2134,7 +2124,6 @@ async function handleProjecao(searchParams) {
 
   const nomes = [
     process.env.GADS_ACCOUNT_PROCESSO || "Verifica Processo",
-    process.env.GADS_ACCOUNT_PLACA || "Verifica Placa",
   ];
 
   try {
@@ -2315,7 +2304,6 @@ async function handleMensal(searchParams) {
 
   const nomes = [
     process.env.GADS_ACCOUNT_PROCESSO || "Verifica Processo",
-    process.env.GADS_ACCOUNT_PLACA || "Verifica Placa",
   ];
 
   try {
@@ -2507,7 +2495,6 @@ export async function GET(request) {
   if (searchParams.get("debug") === "fontes") {
     const nomes = [
       process.env.GADS_ACCOUNT_PROCESSO || "Verifica Processo",
-      process.env.GADS_ACCOUNT_PLACA || "Verifica Placa",
     ];
     try {
       return NextResponse.json(await debugFontes(from, to, nomes), {
@@ -2528,12 +2515,9 @@ export async function GET(request) {
       k
         ? debugPushin(k, from, to, dbg).catch((e) => ({ erro: String(e?.message || e) }))
         : Promise.resolve({ erro: "chave não configurada" });
-    const [proc, placa] = await Promise.all([
-      run(process.env.PUSHIN_KEY_PROCESSO),
-      run(process.env.PUSHIN_KEY_PLACA),
-    ]);
+    const proc = await run(process.env.PUSHIN_KEY_PROCESSO);
     return NextResponse.json(
-      { Processo: proc, Placa: placa },
+      { Processo: proc },
       { headers: { "Cache-Control": "no-store" } }
     );
   }
@@ -2548,7 +2532,6 @@ export async function GET(request) {
   }
 
   const nameProcesso = process.env.GADS_ACCOUNT_PROCESSO || "Verifica Processo";
-  const namePlaca = process.env.GADS_ACCOUNT_PLACA || "Verifica Placa";
 
   const errors = [];
   const warnings = [];
@@ -2557,14 +2540,12 @@ export async function GET(request) {
   const notas = [];
   let gadsRows = [];
   let txProcesso = [];
-  let txPlaca = [];
 
   const budget = makeBudget(BUDGET_MS);
 
   // Funil por marca: Map 'fonte|data' -> { source, date, created, paid }.
   // Cada fetcher registra aqui o que já viu, sem chamada extra a API nenhuma.
   const funnelProcesso = new Map();
-  const funnelPlaca = new Map();
 
   const settle = (p) =>
     p.then(
@@ -2591,17 +2572,6 @@ export async function GET(request) {
       )
     ),
     settle(
-      usandoBanco ? vazio() : fetchAbacateTransactions(
-        process.env.ABACATE_KEY_PLACA,
-        from,
-        to,
-        warnings,
-        "Placa",
-        budget,
-        funnelPlaca
-      )
-    ),
-    settle(
       usandoBanco ? vazio() : fetchStripeTransactions(
         process.env.STRIPE_KEY_PROCESSO,
         from,
@@ -2610,17 +2580,6 @@ export async function GET(request) {
         "Processo",
         budget,
         funnelProcesso
-      )
-    ),
-    settle(
-      usandoBanco ? vazio() : fetchStripeTransactions(
-        process.env.STRIPE_KEY_PLACA,
-        from,
-        to,
-        warnings,
-        "Placa",
-        budget,
-        funnelPlaca
       )
     ),
     // hora a hora do último dia da janela — no FIM para não deslocar os
@@ -2635,18 +2594,6 @@ export async function GET(request) {
         "Processo",
         budget,
         funnelProcesso,
-        notas
-      )
-    ),
-    settle(
-      usandoBanco ? vazio() : fetchPushinTransactions(
-        process.env.PUSHIN_KEY_PLACA,
-        from,
-        to,
-        warnings,
-        "Placa",
-        budget,
-        funnelPlaca,
         notas
       )
     ),
@@ -2665,41 +2612,24 @@ export async function GET(request) {
   if (results[1].status === "fulfilled") txProcesso = results[1].value;
   else errors.push(`Abacate (Processo): ${label(results[1])}`);
 
-  if (results[2].status === "fulfilled") txPlaca = results[2].value;
-  else errors.push(`Abacate (Placa): ${label(results[2])}`);
-
   // Stripe soma às transações da marca. Falha dela é aviso, não erro fatal.
-  if (results[3].status === "fulfilled") txProcesso = txProcesso.concat(results[3].value);
-  else warnings.push(`Stripe (Processo): ${label(results[3])}`);
-
-  if (results[4].status === "fulfilled") txPlaca = txPlaca.concat(results[4].value);
-  else warnings.push(`Stripe (Placa): ${label(results[4])}`);
+  if (results[2].status === "fulfilled") txProcesso = txProcesso.concat(results[2].value);
+  else warnings.push(`Stripe (Processo): ${label(results[2])}`);
 
   let hourlyRows = [];
-  if (results[5].status === "fulfilled") hourlyRows = results[5].value;
-  else warnings.push(`Google Ads (hora a hora): ${label(results[5])}`);
+  if (results[3].status === "fulfilled") hourlyRows = results[3].value;
+  else warnings.push(`Google Ads (hora a hora): ${label(results[3])}`);
 
   // PushinPay soma às transações da marca, igual à Stripe. Falha é aviso, não
   // erro fatal — o resto do dashboard continua de pé.
-  if (results[6].status === "fulfilled") txProcesso = txProcesso.concat(results[6].value);
-  else warnings.push(`PushinPay (Processo): ${label(results[6])}`);
-
-  if (results[7].status === "fulfilled") txPlaca = txPlaca.concat(results[7].value);
-  else warnings.push(`PushinPay (Placa): ${label(results[7])}`);
+  if (results[4].status === "fulfilled") txProcesso = txProcesso.concat(results[4].value);
+  else warnings.push(`PushinPay (Processo): ${label(results[4])}`);
 
   // receita do banco entra aqui, no lugar do que as APIs trariam
   if (usandoBanco) {
     try {
-      const bd = await fetchReceitaDoBanco(from, to, [nameProcesso, namePlaca]);
+      const bd = await fetchReceitaDoBanco(from, to, [nameProcesso]);
       txProcesso = bd.porMarca[nameProcesso] || [];
-      txPlaca = bd.porMarca[namePlaca] || [];
-      if (!bd.separaPorMarca) {
-        notas.push(
-          `Receita lida do banco (${DB_PAID_VIEW}), mas a view não tem coluna de ` +
-            `marca — tudo está somado em ${nameProcesso}. O total está certo; a ` +
-            `divisão por marca, não.`
-        );
-      }
       notas.push(
         `Receita e transações vindas do Postgres, não das APIs de gateway ` +
           `(${bd.linhas} linhas agregadas).`
@@ -2711,16 +2641,10 @@ export async function GET(request) {
     // funil criadas x pagas: a view de pagas não tem as não pagas, então vem
     // da tabela base. Falha aqui não derruba a receita — só apaga a conversão.
     try {
-      const fn = await fetchFunilDoBanco(from, to, [nameProcesso, namePlaca]);
+      const fn = await fetchFunilDoBanco(from, to, [nameProcesso]);
       funnelProcesso.clear();
-      funnelPlaca.clear();
-      for (const [marca, mapa] of [
-        [nameProcesso, funnelProcesso],
-        [namePlaca, funnelPlaca],
-      ]) {
-        for (const f of fn.porMarca[marca] || []) {
-          mapa.set(`${f.source}|${f.date}`, f);
-        }
+      for (const f of fn.porMarca[nameProcesso] || []) {
+        funnelProcesso.set(`${f.source}|${f.date}`, f);
       }
     } catch (e) {
       warnings.push(
@@ -2732,7 +2656,6 @@ export async function GET(request) {
 
   const brands = [
     buildBrand(nameProcesso, gadsRows, txProcesso, [...funnelProcesso.values()], from, to),
-    buildBrand(namePlaca, gadsRows, txPlaca, [...funnelPlaca.values()], from, to),
   ];
 
   // total consolidado
@@ -2798,7 +2721,7 @@ export async function GET(request) {
   // impostos: só no modo db (precisa varrer trimestre e 12 meses de histórico)
   if (usandoBanco && IMPOSTO_ATIVO) {
     try {
-      const imp = await fetchImpostos(from, to, [nameProcesso, namePlaca]);
+      const imp = await fetchImpostos(from, to, [nameProcesso]);
       const regimes = new Set();
       let totalImposto = 0;
       for (const p of total.series) {
@@ -2850,11 +2773,8 @@ export async function GET(request) {
       }
 
       notas.push(
-        `Imposto calculado sobre o faturamento CONSOLIDADO das duas marcas (a ` +
-          `faixa do Simples e o adicional de IRPJ são progressivos sobre o CNPJ ` +
-          `inteiro) e depois RATEADO por marca na proporção da receita do dia. ` +
-          `O total está certo; a divisão por marca é rateio, não apuração ` +
-          `separada.` +
+        `Imposto calculado sobre o faturamento do CNPJ inteiro (a faixa do ` +
+          `Simples e o adicional de IRPJ são progressivos).` +
           (CUSTO_FIXO_MENSAL > 0
             ? ` Custos fixos: ${CUSTOS_FIXOS.map((c) => `${c.nome} ${fmtBRL(c.valorMensal)}`).join(" + ")} = ${fmtBRL(CUSTO_FIXO_MENSAL)}/mês, divididos pelos dias do mês.`
             : "")
@@ -2870,11 +2790,10 @@ export async function GET(request) {
     const fromAnt = mesAnterior(from);
     const toAnt = mesAnterior(to);
     try {
-      const r = await resumoDoPeriodo(fromAnt, toAnt, [nameProcesso, namePlaca]);
+      const r = await resumoDoPeriodo(fromAnt, toAnt, [nameProcesso]);
       anterior = r;
       total.anterior = r.total;
       brands[0].anterior = r.porMarca[nameProcesso];
-      brands[1].anterior = r.porMarca[namePlaca];
     } catch (e) {
       notas.push(`Comparativo com ${fromAnt}..${toAnt} indisponível: ${e?.message || e}`);
     }

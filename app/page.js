@@ -231,11 +231,6 @@ export default function Page() {
       {data && (
         <>
           <Section brand={data.total} color="#c9d4e8" title="Total" />
-          <Section
-            brand={data.brands[0]}
-            color="var(--processo)"
-            title={data.brands[0].name}
-          />
           <ProjecaoSection />
           <ConversaoHojeSection />
           <ConversaoHistoricoSection />
