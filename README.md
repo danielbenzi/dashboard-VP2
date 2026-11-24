@@ -1,10 +1,10 @@
-# Dashboard — Verifica Processo & Verifica Placa
+# Dashboard — Verifica Processo
 
 Dashboard simples e sempre atualizado com **gasto, transações, CPA, ROAS e receita paga**
-por marca (Verifica Processo e Verifica Placa). Os dados vêm de:
+da Verifica Processo. Os dados vêm de:
 
 - **Google Ads** (gasto, cliques, impressões) → via API do **Windsor.ai**
-- **AbacatePay** (transações pagas e receita) → via API do **AbacatePay**, uma chave por marca
+- **AbacatePay** (transações pagas e receita) → via API do **AbacatePay**
 
 Feito em Next.js, pronto para deploy na **Vercel**. As chaves ficam só no servidor
 (variáveis de ambiente) — nunca aparecem no navegador.
@@ -36,8 +36,7 @@ O padrão é **mês atual**.
 
 - **Windsor.ai:** entre no painel do Windsor → seção de API / Onboarding API → copie a `api_key`.
 - **AbacatePay:** no painel ([app.abacatepay.com](https://app.abacatepay.com)) → Integração → Chaves de API.
-  Você tem **uma conta por marca**, então copie a chave de **cada** conta:
-  uma da Verifica Processo e outra da Verifica Placa.
+  Copie a chave da conta da Verifica Processo.
   (Use chaves de **Produção** para ver dados reais.)
 
 ### 2. Subir o projeto
@@ -64,9 +63,7 @@ Na Vercel: **Project → Settings → Environment Variables**. Adicione:
 | ------------------------ | --------------------------------------------------- |
 | `WINDSOR_API_KEY`        | sua chave do Windsor.ai                              |
 | `ABACATE_KEY_PROCESSO`   | chave do AbacatePay da conta **Verifica Processo**  |
-| `ABACATE_KEY_PLACA`      | chave do AbacatePay da conta **Verifica Placa**     |
 | `GADS_ACCOUNT_PROCESSO`  | `Verifica Processo` (só mude se renomear no Windsor)|
-| `GADS_ACCOUNT_PLACA`     | `Verifica Placa` (só mude se renomear no Windsor)   |
 
 Veja `.env.example` para o modelo. Depois de salvar, clique em **Deploy** (ou **Redeploy**).
 

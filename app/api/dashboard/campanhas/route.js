@@ -27,7 +27,7 @@
 //   DB_VIEW_AMOUNT_DIVISOR   = 1      (a VIEW já vem em reais; a tabela base não)
 //   CAMPANHA_ROAS_ALVO       = 1.4
 //   CAMPANHA_PRODUTO_MAP     = JSON [{"produto":"...","padroes":["..."]}]
-//   GADS_ACCOUNT_PROCESSO / GADS_ACCOUNT_PLACA
+//   GADS_ACCOUNT_PROCESSO
 //   WINDSOR_REFRESH_SINCE / WINDSOR_REFRESH_INTERVAL
 
 import { NextResponse } from "next/server";
@@ -98,7 +98,6 @@ export async function fetchCampanhas(from, to, sinal) {
 
   const contas = [
     process.env.GADS_ACCOUNT_PROCESSO || "Verifica Processo",
-    process.env.GADS_ACCOUNT_PLACA || "Verifica Placa",
   ];
   // Sem refresh o Windsor serve cache de até 6 HORAS e o dia corrente chega
   // pela metade. Mesmas envs que as outras rotas já usam.
