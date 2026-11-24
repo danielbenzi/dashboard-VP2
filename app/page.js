@@ -158,7 +158,7 @@ export default function Page() {
       </nav>
       <div className="topbar">
         <div className="title">
-          <h1>Verifica Processo &amp; Verifica Placa</h1>
+          <h1>Verifica Processo</h1>
           <p>
             Gasto, transações, CPA, ROAS e receita paga · Google Ads + AbacatePay
             + PushinPay + Stripe
@@ -235,11 +235,6 @@ export default function Page() {
             brand={data.brands[0]}
             color="var(--processo)"
             title={data.brands[0].name}
-          />
-          <Section
-            brand={data.brands[1]}
-            color="var(--placa)"
-            title={data.brands[1].name}
           />
           <ProjecaoSection />
           <ConversaoHojeSection />

@@ -6,7 +6,7 @@ import Link from "next/link";
 import { CampanhasSection } from "../components/Campanhas";
 
 export const metadata = {
-  title: "Campanhas — Verifica Processo & Verifica Placa",
+  title: "Campanhas — Verifica Processo",
 };
 
 export default function CampanhasPage() {
