@@ -176,18 +176,44 @@ export const derivadas = (o) => {
 
 export function montaCampanhas(linhas, mapa) {
   const porCampanha = new Map();
+  // campanha -> dia -> métricas, para a evolução dia a dia
+  const porDia = new Map();
+  const dias = new Set();
   for (const l of linhas) {
     const nome = String(l.campaign ?? "").trim() || "(sem nome)";
-    const atual = porCampanha.get(nome) || zeroC();
-    somaC(atual, {
+    const valores = {
       spend: num(l.spend),
       clicks: num(l.clicks),
       impressions: num(l.impressions),
       conversions: num(l.conversions),
       convValue: num(l.conversion_value),
-    });
+    };
+    const atual = porCampanha.get(nome) || zeroC();
+    somaC(atual, valores);
     porCampanha.set(nome, atual);
+
+    const dia = String(l.date ?? "").slice(0, 10);
+    if (dia) {
+      dias.add(dia);
+      if (!porDia.has(nome)) porDia.set(nome, new Map());
+      const doDia = porDia.get(nome);
+      doDia.set(dia, somaC(doDia.get(dia) || zeroC(), valores));
+    }
   }
+  // Mesmo eixo de dias para todas as campanhas: dia sem linha é dia de zero,
+  // não um buraco que encurta o gráfico.
+  const diasOrdenados = [...dias].sort();
+  const serieDe = (nome) =>
+    diasOrdenados.map((date) => {
+      const v = porDia.get(nome)?.get(date) || zeroC();
+      return {
+        date,
+        spend: r2(v.spend),
+        convValue: r2(v.convValue),
+        conversions: r2(v.conversions),
+        roas: v.spend > 0 ? v.convValue / v.spend : null,
+      };
+    });
 
   // O bruto fica guardado à parte: agregar somando valores já arredondados
   // erra centavos no total, e total que não fecha com a soma das linhas é o
@@ -202,6 +228,7 @@ export function montaCampanhas(linhas, mapa) {
         tipo: tipoDaCampanha(campanha),
         produto: produtoDaCampanha(campanha, mapa),
         ...derivadas(v),
+        serie: serieDe(campanha),
       };
     })
     // por take rate: o que interessa é quanto cada campanha SOBRA, não o ROAS
@@ -234,6 +261,35 @@ export function montaCampanhas(linhas, mapa) {
   };
 
   return { campanhas, tipos, produtos, genericas, total: agrega(() => true) };
+}
+
+// Período imediatamente anterior, com o mesmo número de dias.
+export function periodoAnterior(de, ate) {
+  const dia = (s) => new Date(`${s}T12:00:00Z`);
+  const iso = (d) => d.toISOString().slice(0, 10);
+  const n = Math.round((dia(ate) - dia(de)) / 86400000) + 1;
+  const fim = dia(de);
+  fim.setUTCDate(fim.getUTCDate() - 1);
+  const ini = new Date(fim);
+  ini.setUTCDate(ini.getUTCDate() - (n - 1));
+  return { de: iso(ini), ate: iso(fim) };
+}
+
+// Só o que a tela compara. Campanha que não existia antes fica sem `anterior`.
+const resumo = (o) =>
+  o ? { spend: o.spend, convValue: o.convValue, takeRate: o.takeRate, roas: o.roas } : null;
+
+export function anexaAnterior(bloco, antes) {
+  const por = (lista, chaveId) => new Map(lista.map((x) => [x[chaveId], x]));
+  const camp = por(antes.campanhas, "campanha");
+  const prod = por(antes.produtos, "produto");
+  const tipo = por(antes.tipos, "tipo");
+  for (const c of bloco.campanhas) c.anterior = resumo(camp.get(c.campanha));
+  for (const p of bloco.produtos) p.anterior = resumo(prod.get(p.produto));
+  for (const t of bloco.tipos) t.anterior = resumo(tipo.get(t.tipo));
+  bloco.genericas.anterior = antes.genericas.campanhas.length ? resumo(antes.genericas) : null;
+  bloco.total.anterior = antes.campanhas.length ? resumo(antes.total) : null;
+  return bloco;
 }
 
 // Ação de conversão mal configurada: muitas conversões valendo quase nada.
@@ -315,7 +371,9 @@ export async function GET(request) {
   const timer = setTimeout(() => ctrl.abort(), 40000);
 
   try {
-    const gads = await fetchCampanhas(de, ate, ctrl.signal);
+    // Uma chamada só cobre o período e o anterior; a separação é por data.
+    const antes = periodoAnterior(de, ate);
+    const gads = await fetchCampanhas(antes.de, ate, ctrl.signal);
     if (gads.erro) {
       return NextResponse.json(
         { erro: `Google Ads indisponível: ${gads.erro}` },
@@ -323,7 +381,14 @@ export async function GET(request) {
       );
     }
 
-    const bloco = montaCampanhas(gads.linhas, mapa);
+    const doPeriodo = (l) => {
+      const dia = String(l.date ?? "").slice(0, 10);
+      return !dia || dia >= de;
+    };
+    const bloco = anexaAnterior(
+      montaCampanhas(gads.linhas.filter(doPeriodo), mapa),
+      montaCampanhas(gads.linhas.filter((l) => !doPeriodo(l)), mapa)
+    );
 
     // ---- produto pelo banco (verdade do caixa, sem atribuição) ----
     let produtosBanco = null;
@@ -406,6 +471,7 @@ export async function GET(request) {
     return NextResponse.json(
       {
         periodo: { de, ate },
+        periodoAnterior: antes,
         roasAlvo: ROAS_ALVO,
         ...bloco,
         produtosBanco,
