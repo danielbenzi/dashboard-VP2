@@ -143,7 +143,11 @@ function Linhas({ linhas, rotulo, alvo, chaveId }) {
 }
 
 function Conteudo() {
+  // Ou um atalho (`dias`) ou um intervalo escolhido (`intervalo`), nunca os dois.
   const [dias, setDias] = useState(7);
+  const [intervalo, setIntervalo] = useState(null);
+  const [de, setDe] = useState("");
+  const [ate, setAte] = useState("");
   const [aba, setAba] = useState("campanhas");
   const [d, setD] = useState(null);
   const [err, setErr] = useState(null);
@@ -153,16 +157,41 @@ function Conteudo() {
   const busca = useCallback(() => {
     setCarregando(true);
     setErr(null);
-    fetch(`/api/dashboard/campanhas?dias=${dias}`, { cache: "no-store" })
+    const qs = intervalo ? `from=${intervalo.de}&to=${intervalo.ate}` : `dias=${dias}`;
+    fetch(`/api/dashboard/campanhas?${qs}`, { cache: "no-store" })
       .then((r) => r.json())
       .then((j) => (j.erro ? setErr(j.erro) : (setD(j), setEm(Date.now()))))
       .catch((e) => setErr(String(e?.message || e)))
       .finally(() => setCarregando(false));
-  }, [dias]);
+  }, [dias, intervalo]);
 
   useEffect(() => {
     busca();
   }, [busca]);
+
+  // Os campos de data acompanham o período que a API de fato devolveu.
+  useEffect(() => {
+    if (d?.periodo) {
+      setDe(d.periodo.de);
+      setAte(d.periodo.ate);
+    }
+  }, [d]);
+
+  const intervaloValido = Boolean(de && ate && de <= ate);
+  const aplicaIntervalo = () => {
+    if (!intervaloValido) return;
+    setDias(null);
+    setIntervalo({ de, ate });
+  };
+  const estiloData = {
+    background: "var(--panel-2)",
+    color: "var(--text)",
+    border: "1px solid var(--border)",
+    borderRadius: 6,
+    padding: "5px 8px",
+    font: "inherit",
+    colorScheme: "dark",
+  };
 
   const alvo = d?.roasAlvo ?? 1.4;
   const conf = d?.conferencia;
@@ -175,12 +204,51 @@ function Conteudo() {
       </div>
 
       <div className="table-card">
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+        <div
+          style={{
+            display: "flex",
+            gap: 8,
+            flexWrap: "wrap",
+            alignItems: "center",
+            marginBottom: 12,
+          }}
+        >
           {JANELAS.map((j) => (
-            <Botao key={j.dias} ativo={dias === j.dias} onClick={() => setDias(j.dias)}>
+            <Botao
+              key={j.dias}
+              ativo={!intervalo && dias === j.dias}
+              onClick={() => {
+                setIntervalo(null);
+                setDias(j.dias);
+              }}
+            >
               {j.rot}
             </Botao>
           ))}
+          <input
+            type="date"
+            aria-label="Data inicial"
+            value={de}
+            max={ate || undefined}
+            onChange={(e) => setDe(e.target.value)}
+            style={estiloData}
+          />
+          <span style={{ color: "var(--muted)" }}>a</span>
+          <input
+            type="date"
+            aria-label="Data final"
+            value={ate}
+            min={de || undefined}
+            onChange={(e) => setAte(e.target.value)}
+            style={estiloData}
+          />
+          <Botao
+            ativo={Boolean(intervalo)}
+            onClick={aplicaIntervalo}
+            disabled={!intervaloValido || carregando}
+          >
+            aplicar
+          </Botao>
           <span style={{ flex: 1 }} />
           <Botao ativo={false} onClick={busca} disabled={carregando}>
             {carregando ? "atualizando…" : "atualizar"}
