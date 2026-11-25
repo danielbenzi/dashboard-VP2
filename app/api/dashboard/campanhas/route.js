@@ -361,6 +361,36 @@ export async function GET(request) {
     de = d.toISOString().slice(0, 10);
   }
 
+  // /api/dashboard/campanhas?debug=colunas — só nomes e tipos das colunas da
+  // view, sem nenhuma linha de dado. Serve para descobrir onde está o click id.
+  if (searchParams.get("debug") === "colunas") {
+    if (!process.env.DATABASE_URL) {
+      return NextResponse.json({ erro: "DATABASE_URL ausente" }, { status: 500 });
+    }
+    const view = process.env.DB_PAID_VIEW || "public.vw_transactions_paid";
+    const [schema, nome] = view.includes(".") ? view.split(".") : ["public", view];
+    const { Client } = await import("pg");
+    const client = new Client({
+      connectionString: process.env.DATABASE_URL,
+      ssl: /sslmode=disable/.test(process.env.DATABASE_URL || "")
+        ? false
+        : { rejectUnauthorized: false },
+    });
+    try {
+      await client.connect();
+      const { rows } = await client.query(
+        `SELECT column_name, data_type FROM information_schema.columns
+          WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position`,
+        [schema.replace(/"/g, ""), nome.replace(/"/g, "")]
+      );
+      return NextResponse.json({ view, colunas: rows }, { headers: { "Cache-Control": "no-store" } });
+    } catch (e) {
+      return NextResponse.json({ erro: String(e?.message || e) }, { status: 500 });
+    } finally {
+      await client.end().catch(() => {});
+    }
+  }
+
   const avisos = [];
   const mapa = carregaMapa();
   if (process.env.CAMPANHA_PRODUTO_MAP && mapa === MAPA_PADRAO) {
