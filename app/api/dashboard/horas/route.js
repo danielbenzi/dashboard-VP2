@@ -495,7 +495,14 @@ export async function GET(request) {
       return { mediana: r2(mediana), piso: r2(piso), parciais };
     };
 
-    const parcial = custoOk
+    // Dia já encerrado (?hoje=AAAA-MM-DD no passado): o gasto chegou inteiro,
+    // então não há cauda parcial para marcar — a madrugada barata de um dia
+    // fechado é barata de verdade.
+    const hojeReal = new Date().toLocaleDateString("en-CA", { timeZone: TZ });
+    const diaFechado = hojeISO < hojeReal;
+    payload.diaFechado = diaFechado;
+
+    const parcial = custoOk && !diaFechado
       ? marcaParciais(payload.hoje.horas)
       : { mediana: null, parciais: 0 };
 

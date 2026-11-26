@@ -308,3 +308,34 @@ body {
   color: var(--text);
   border-bottom-color: var(--accent);
 }
+
+/* Seletor de dia da conversão hora a hora */
+.btn-dia,
+.input-dia {
+  background: var(--panel-2);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 13px;
+  color-scheme: dark;
+}
+.btn-dia {
+  cursor: pointer;
+}
+.btn-dia:hover:not(:disabled) {
+  color: var(--text);
+}
+.btn-dia:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.btn-dia.ativo {
+  background: #256abf;
+  border-color: #256abf;
+  color: #fff;
+}
+.input-dia {
+  color: var(--text);
+}

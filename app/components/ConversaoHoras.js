@@ -2,7 +2,7 @@
 
 // app/components/ConversaoHoras.js
 //
-//   <ConversaoHojeSection />      -> hoje, hora a hora (sempre hoje)
+//   <ConversaoHojeSection />      -> hoje, hora a hora (hoje ou um dia escolhido)
 //   <ConversaoHistoricoSection /> -> dia da semana × hora, por dia da semana,
 //                                    por hora e dia a dia
 //
@@ -175,10 +175,63 @@ function Avisos({ d }) {
 
 // ------------------------------------------------------------- hoje
 
+// soma `n` dias a uma data AAAA-MM-DD
+const somaDias = (iso, n) => {
+  const d = new Date(`${iso}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+
 function HojeSection() {
-  const { d: bruto, err, loading, buscando, em, recarregar } = useHoras();
+  const atual = useHoras();
+  const hojeReal = temForma(atual.d) ? atual.d.hoje.date : null;
+
+  // `dia` nulo = hoje, servido pelo store compartilhado com o histórico. Um
+  // dia passado tem busca própria, só desta seção: o histórico abaixo continua
+  // na base de hoje.
+  const [dia, setDia] = useState(null);
+  const [outro, setOutro] = useState({ d: null, err: null, buscando: false, em: null });
+  const [tentativa, setTentativa] = useState(0);
+  useEffect(() => {
+    if (!dia) return;
+    let vivo = true;
+    setOutro((o) => ({ ...o, err: null, buscando: true }));
+    // dias=7 é o mínimo da rota: aqui só interessa o dia escolhido
+    fetch(`/api/dashboard/horas?hoje=${dia}&dias=7`, { cache: "no-store" })
+      .then((r) => r.json())
+      .then((j) => {
+        if (!vivo) return;
+        setOutro(
+          j?.erro
+            ? { d: null, err: j.erro, buscando: false, em: Date.now() }
+            : { d: j, err: null, buscando: false, em: Date.now() }
+        );
+      })
+      .catch((e) => {
+        if (vivo) setOutro({ d: null, err: String(e?.message || e), buscando: false, em: Date.now() });
+      });
+    return () => {
+      vivo = false;
+    };
+  }, [dia, tentativa]);
+
+  const escolhe = (iso) => {
+    if (!iso || !hojeReal || iso >= hojeReal) {
+      setDia(null);
+      return;
+    }
+    if (iso !== dia) setOutro({ d: null, err: null, buscando: true, em: null });
+    setDia(iso);
+  };
+
+  const { d: bruto, err, loading, buscando, em } = dia
+    ? { ...outro, loading: outro.buscando && !outro.d }
+    : atual;
+  const recarregar = dia ? () => setTentativa((n) => n + 1) : atual.recarregar;
   const d = temForma(bruto) ? bruto : null;
   const horas = d?.hoje?.horas || [];
+  const diaMostrado = dia || hojeReal;
+  const rotuloDia = dia ? `${dia.slice(8, 10)}/${dia.slice(5, 7)}` : "hoje";
 
   // O máximo da barra ignora as horas de amostra baixa: uma hora com 1 de 1
   // paga marcaria 100% e esmagaria todas as barras reais contra o zero.
@@ -204,8 +257,60 @@ function HojeSection() {
     <>
       <div className="section-title">
         <span className="dot" style={{ background: RAMPA[3] }} />
-        Conversão de hoje, hora a hora
+        Conversão de {rotuloDia}, hora a hora
       </div>
+
+      {hojeReal && (
+        <div
+          style={{
+            display: "flex",
+            gap: 8,
+            flexWrap: "wrap",
+            alignItems: "center",
+            marginBottom: 10,
+          }}
+        >
+          <button
+            type="button"
+            className="btn-dia"
+            onClick={() => escolhe(somaDias(diaMostrado, -1))}
+            aria-label="Dia anterior"
+          >
+            ◀ dia anterior
+          </button>
+          <input
+            type="date"
+            className="input-dia"
+            aria-label="Dia"
+            value={diaMostrado}
+            max={hojeReal}
+            onChange={(e) => escolhe(e.target.value)}
+          />
+          <button
+            type="button"
+            className="btn-dia"
+            onClick={() => escolhe(somaDias(diaMostrado, 1))}
+            disabled={!dia}
+            aria-label="Dia seguinte"
+          >
+            dia seguinte ▶
+          </button>
+          <button
+            type="button"
+            className={`btn-dia${dia ? "" : " ativo"}`}
+            onClick={() => escolhe(null)}
+          >
+            hoje
+          </button>
+          <button
+            type="button"
+            className={`btn-dia${dia === somaDias(hojeReal, -1) ? " ativo" : ""}`}
+            onClick={() => escolhe(somaDias(hojeReal, -1))}
+          >
+            ontem
+          </button>
+        </div>
+      )}
 
       {loading && <div className="table-card loading">Carregando…</div>}
       {err && <div className="banner">Conversão por hora indisponível: {err}</div>}
@@ -274,7 +379,7 @@ function HojeSection() {
               </thead>
               <tbody>
                 {horas.map((h) => {
-                  const passou = h.hora <= horaAtual;
+                  const passou = Boolean(dia) || h.hora <= horaAtual;
                   const vazia = h.criadas === 0 && !(h.custo > 0);
                   // Mesma regra do heatmap: 1 de 2 pagas é 50% e não quer dizer
                   // nada. A barra some para não dar peso visual de hora boa; o
@@ -294,7 +399,7 @@ function HojeSection() {
                     >
                       <td style={{ whiteSpace: "nowrap" }}>
                         {hhmm(h.hora)}
-                        {h.hora === horaAtual && (
+                        {!dia && h.hora === horaAtual && (
                           <span style={{ color: "var(--amber)" }}> ·agora</span>
                         )}
                       </td>
